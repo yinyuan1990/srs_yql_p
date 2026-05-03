@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(find:*)",
+      "Bash(plutil:*)",
+      "Bash(otool:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(security cms -D -i /Users/chengyuan/eth/peizhi.mobileprovision)",
+      "Bash(openssl pkcs12 -in /Users/chengyuan/eth/fenfa.p12 -nokeys -passin pass:)",
+      "Bash(# 检查mobileprovision的类型（企业分发/Ad Hoc/App Store/开发） security cms -D -i /Users/chengyuan/eth/peizhi.mobileprovision)",
+      "Bash(# 检查是否包含 ProvisionsAllDevices（企业证书标志） security cms -D -i /Users/chengyuan/eth/peizhi.mobileprovision)",
+      "Bash(grep -r \"PRODUCT_BUNDLE_IDENTIFIER\" /Users/chengyuan/aiqipai/ios/srs_yql/*.xcodeproj/project.pbxproj)",
+      "Bash(security import /Users/chengyuan/eth/fenfa.p12 -k ~/Library/Keychains/login.keychain-db -P \"123456\" -T /usr/bin/codesign)",
+      "Bash(security find-identity -v -p codesigning)",
+      "Bash(openssl pkcs12 -in /Users/chengyuan/eth/fenfa.p12 -passin pass:123456 -nokeys)",
+      "Bash(openssl x509 -noout -subject -dates -text)",
+      "Bash(openssl pkcs12 -in /Users/chengyuan/eth/fenfa.p12 -passin pass:123456 -nodes)",
+      "Bash(openssl x509 -noout -subject -dates)",
+      "Bash(openssl pkcs12 -in /Users/chengyuan/eth/fenfa.p12 -passin pass:123456 -legacy -nokeys)",
+      "Bash(openssl x509 -in /Users/chengyuan/eth/ios_distribution.cer -inform DER -noout -subject -dates)",
+      "Bash(xcodebuild -version)",
+      "Bash(security cms:*)",
+      "Bash(openssl x509:*)",
+      "Bash(xmllint --xpath //data -)",
+      "Bash(ls /Users/chengyuan/aiqipai/ios/srs_yql_p/*.md)",
+      "Read(//Users/chengyuan/aiqipai/ios/**)",
+      "Read(//Users/chengyuan/aiqipai/**)"
+    ]
+  }
+}

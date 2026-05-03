@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>金凤凰.ipa</key>
+	<array>
+		<dict>
+			<key>architectures</key>
+			<array>
+				<string>arm64</string>
+			</array>
+			<key>buildNumber</key>
+			<string>6</string>
+			<key>certificate</key>
+			<dict>
+				<key>SHA1</key>
+				<string>FAF8D723B20D15B52979C19C738CD084A3287E3B</string>
+				<key>dateExpires</key>
+				<string>6/2/26</string>
+				<key>type</key>
+				<string>Apple Development</string>
+			</dict>
+			<key>embeddedBinaries</key>
+			<array>
+				<dict>
+					<key>architectures</key>
+					<array>
+						<string>arm64</string>
+					</array>
+					<key>buildNumber</key>
+					<string>1.0</string>
+					<key>certificate</key>
+					<dict>
+						<key>SHA1</key>
+						<string>FAF8D723B20D15B52979C19C738CD084A3287E3B</string>
+						<key>dateExpires</key>
+						<string>6/2/26</string>
+						<key>type</key>
+						<string>Apple Development</string>
+					</dict>
+					<key>name</key>
+					<string>WebRTC.framework</string>
+					<key>team</key>
+					<dict>
+						<key>id</key>
+						<string>AV662P693M</string>
+						<key>name</key>
+						<string>yuan yin</string>
+					</dict>
+					<key>versionNumber</key>
+					<string>1.0</string>
+				</dict>
+			</array>
+			<key>entitlements</key>
+			<dict>
+				<key>application-identifier</key>
+				<string>AV662P693M.com.ai.yql</string>
+				<key>com.apple.developer.team-identifier</key>
+				<string>AV662P693M</string>
+				<key>get-task-allow</key>
+				<true/>
+			</dict>
+			<key>name</key>
+			<string>金凤凰.app</string>
+			<key>profile</key>
+			<dict>
+				<key>UUID</key>
+				<string>d32e6f52-09f0-4ce3-b993-209e0aae014f</string>
+				<key>dateExpires</key>
+				<string>8/13/26</string>
+				<key>name</key>
+				<string>iOS Team Provisioning Profile: *</string>
+			</dict>
+			<key>team</key>
+			<dict>
+				<key>id</key>
+				<string>AV662P693M</string>
+				<key>name</key>
+				<string>yuan yin</string>
+			</dict>
+			<key>versionNumber</key>
+			<string>1.5</string>
+		</dict>
+	</array>
+</dict>
+</plist>

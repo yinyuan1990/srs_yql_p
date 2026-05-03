@@ -1,0 +1,48 @@
+# ============ 系统 ============
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ============ Xcode ============
+build/
+DerivedData/
+*.xcuserdatad/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# Build products
+*.ipa
+*.app
+*.dSYM
+*.dSYM.zip
+
+# ============ Swift Package Manager ============
+.build/
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+
+# ============ CocoaPods ============
+# 推荐 commit Pods/ 让 Windows 端不需要 pod install；如果想忽略取消下面的注释
+# Pods/
+# Podfile.lock
+
+# ============ Carthage ============
+Carthage/Build/
+
+# ============ 项目特定（手动加的备份/日志/大文件） ============
+srs.zip
+build.log
+*.log
+*.bak
+
+# ============ 编辑器 / IDE ============
+.vscode/
+.idea/
+*.swp
+*~

@@ -512,6 +512,14 @@ struct MonitorLoginView: View {
                             UserDefaults.standard.set(data, forKey: "iceServers")
                             let turnCount = iceServers.filter { $0.urls.contains(where: { $0.hasPrefix("turn:") }) }.count
                             print("🔄 [Login] iceServers: \(iceServers.count) 个 (TURN=\(turnCount))")
+                            // ⭐ 通知所有持有 WebRTCManager 实例的视图刷新 iceServerConfig（@StateObject 兜底）
+                            //   实际生效靠 createViewerSession 里的 UserDefaults 重读逻辑，
+                            //   这里发通知主要是给当前内存里已存在的 WebRTCManager 一个立即更新机会。
+                            NotificationCenter.default.post(
+                                name: NSNotification.Name("iceServersUpdated"),
+                                object: nil,
+                                userInfo: ["iceServers": iceServers]
+                            )
                         }
                     }
                     

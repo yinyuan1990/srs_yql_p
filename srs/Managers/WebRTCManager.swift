@@ -823,6 +823,18 @@ final class WebRTCManager: NSObject, ObservableObject {
     
     // MARK: - 🔥 v2.0 PC端自适应FPS指令处理
     
+    /// ⭐ 登录后 iceServers 更新通知处理（修复 WebRTCManager init 早于登录写入 UserDefaults 的时序）
+    @objc private func onIceServersUpdated(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let servers = userInfo["iceServers"] as? [IceServer] else {
+            return
+        }
+        let oldCount = iceServerConfig.count
+        iceServerConfig = servers
+        let turnCount = servers.filter { $0.urls.contains(where: { $0.hasPrefix("turn:") }) }.count
+        print("🔄 [iceServersUpdated] iceServerConfig 已更新: \(oldCount) → \(servers.count) 个 (TURN=\(turnCount))")
+    }
+
     /// 处理 PC 端发来的 set_fps 通知
     @objc private func onSetFpsRequested(_ notification: Notification) {
         guard let userInfo = notification.userInfo,
@@ -2209,6 +2221,14 @@ final class WebRTCManager: NSObject, ObservableObject {
                 name: .setFpsRequested,
                 object: nil
         )
+
+        // ⭐ 监听登录后下发的 iceServers 更新通知（修复 init 早于登录写入的时序问题）
+        NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onIceServersUpdated(_:)),
+                name: NSNotification.Name("iceServersUpdated"),
+                object: nil
+        )
         
         // ★ 从 UserDefaults 读取强制中继开关（登录时保存）
         forceRelay = UserDefaults.standard.bool(forKey: "forceRelay")
@@ -2698,9 +2718,23 @@ final class WebRTCManager: NSObject, ObservableObject {
         // 4. 创建 RTCConfiguration（与 startPublish 中相同的 ICE 配置）
         let cfg = RTCConfiguration()
         cfg.sdpSemantics = .unifiedPlan
-        
-        if !iceServerConfig.isEmpty {
-            cfg.iceServers = iceServerConfig.map { server in
+
+        // ⭐ 每次创建 PeerConnection 都从 UserDefaults 重新加载 ICE 配置（自动跟进后端最新数据）
+        //   背景: WebRTCManager 是 @StateObject(非单例)，init() 时机可能早于登录写入 UserDefaults，
+        //   导致内存 iceServerConfig=[] 但 UserDefaults 已有最新 6 条配置。这里兜底读一次。
+        var effectiveIceServers = iceServerConfig
+        if let data = UserDefaults.standard.data(forKey: "iceServers"),
+           let servers = try? JSONDecoder().decode([IceServer].self, from: data),
+           !servers.isEmpty {
+            if servers.count != iceServerConfig.count {
+                print("🔄 [P2P] iceServerConfig 已从 UserDefaults 重新加载: \(iceServerConfig.count) → \(servers.count) 个")
+                iceServerConfig = servers
+            }
+            effectiveIceServers = servers
+        }
+
+        if !effectiveIceServers.isEmpty {
+            cfg.iceServers = effectiveIceServers.map { server in
                 if let username = server.username,
                    let credential = server.credential {
                     return RTCIceServer(urlStrings: server.urls, username: username, credential: credential)
@@ -2708,8 +2742,8 @@ final class WebRTCManager: NSObject, ObservableObject {
                     return RTCIceServer(urlStrings: server.urls)
                 }
             }
-            let turnCount = iceServerConfig.filter { $0.urls.contains(where: { $0.hasPrefix("turn:") }) }.count
-            print("🔔 [P2P] ICE 服务器: \(iceServerConfig.count) 个 (TURN=\(turnCount))")
+            let turnCount = effectiveIceServers.filter { $0.urls.contains(where: { $0.hasPrefix("turn:") }) }.count
+            print("🔔 [P2P] ICE 服务器: \(effectiveIceServers.count) 个 (TURN=\(turnCount))")
         } else {
             cfg.iceServers = [
                 RTCIceServer(urlStrings: ["stun:stun.miwifi.com:3478"]),

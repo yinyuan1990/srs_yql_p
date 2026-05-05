@@ -1032,9 +1032,12 @@ final class WebRTCManager: NSObject, ObservableObject {
                 let minISO = device.activeFormat.minISO
                 let maxISO = device.activeFormat.maxISO
                 // 使用 1/3 位置的 ISO，提供正常亮度
-                let fixedISO = minISO + (maxISO - minISO) / 3
+                // ⭐ 亮度方案 1: 把 ISO 从 1/3 位上调到 1/2 位（亮约 1 档）
+                //   背景: 同款相机同等距离, 竞品画面偏亮; 主因是 ISO 锁低位过暗。
+                //   只动 ISO 不动 duration, 快门(cjfpsValue) 链路不受影响。
+                let fixedISO = minISO + (maxISO - minISO) / 2
                 device.setExposureModeCustom(duration: safeDuration, iso: fixedISO, completionHandler: nil)
-                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO)(固定,范围\(minISO)-\(maxISO))")
+                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO)(中位,范围\(minISO)-\(maxISO))")
                 
                 // 🔥🔥 关键：显式锁定帧率，防止手动曝光后帧率被自动降低
                 // 直接使用 currentCaptureFPS（采集时已正确设置）
@@ -3309,9 +3312,12 @@ final class WebRTCManager: NSObject, ObservableObject {
                 let minISO = device.activeFormat.minISO
                 let maxISO = device.activeFormat.maxISO
                 // 使用 1/3 位置的 ISO，提供正常亮度
-                let fixedISO = minISO + (maxISO - minISO) / 3
+                // ⭐ 亮度方案 1: 把 ISO 从 1/3 位上调到 1/2 位（亮约 1 档）
+                //   背景: 同款相机同等距离, 竞品画面偏亮; 主因是 ISO 锁低位过暗。
+                //   只动 ISO 不动 duration, 快门(cjfpsValue) 链路不受影响。
+                let fixedISO = minISO + (maxISO - minISO) / 2
                 device.setExposureModeCustom(duration: safeDuration, iso: fixedISO, completionHandler: nil)
-                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO)(固定,范围\(minISO)-\(maxISO))")
+                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO)(中位,范围\(minISO)-\(maxISO))")
                 
                 // 🔥🔥 关键：显式锁定帧率，防止手动曝光后帧率被自动降低
                 // 直接使用 currentCaptureFPS（在 startCapture 前已正确设置）

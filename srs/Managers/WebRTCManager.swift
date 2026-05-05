@@ -1032,12 +1032,17 @@ final class WebRTCManager: NSObject, ObservableObject {
                 let minISO = device.activeFormat.minISO
                 let maxISO = device.activeFormat.maxISO
                 // 使用 1/3 位置的 ISO，提供正常亮度
-                // ⭐ 亮度方案 1: 把 ISO 从 1/3 位上调到 1/2 位（亮约 1 档）
-                //   背景: 同款相机同等距离, 竞品画面偏亮; 主因是 ISO 锁低位过暗。
-                //   只动 ISO 不动 duration, 快门(cjfpsValue) 链路不受影响。
-                let fixedISO = minISO + (maxISO - minISO) / 2
+                // ⭐ ISO 选择:
+                //   autoIsoEnabled=true  → 用当前 device.iso (闭环 timer 已在持续调整, 别覆盖它)
+                //   autoIsoEnabled=false → 中位 ISO (max-min)/2, 比之前 1/3 位亮 1 档
+                let fixedISO: Float
+                if autoIsoEnabled {
+                    fixedISO = device.iso       // 保留闭环值, 后续 timer 会继续微调
+                } else {
+                    fixedISO = minISO + (maxISO - minISO) / 2
+                }
                 device.setExposureModeCustom(duration: safeDuration, iso: fixedISO, completionHandler: nil)
-                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO)(中位,范围\(minISO)-\(maxISO))")
+                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO) [\(autoIsoEnabled ? "auto闭环" : "中位")] 范围\(minISO)-\(maxISO)")
                 
                 // 🔥🔥 关键：显式锁定帧率，防止手动曝光后帧率被自动降低
                 // 直接使用 currentCaptureFPS（采集时已正确设置）
@@ -1055,7 +1060,66 @@ final class WebRTCManager: NSObject, ObservableObject {
             print("❌ [快门调整] 失败: \(error.localizedDescription)")
         }
     }
-    
+
+    // MARK: - ⭐ 自动 ISO 闭环 (S 档: 快门固定, ISO 跟随光线)
+
+    /// 启动自动 ISO 调整循环
+    /// 每秒一次: 读 device.exposureTargetOffset (系统判断的过曝/欠曝 EV)
+    /// 按 EV 偏差调整 ISO (1 EV ≈ ISO 翻倍), 保持 duration 不变
+    private func startAutoIsoLoop() {
+        stopAutoIsoLoop()  // 防重复启动
+        print("🔄 [AutoISO] 启动闭环 ISO 调整 (1Hz, 快门固定 ISO 跟随)")
+        DispatchQueue.main.async { [weak self] in
+            self?.autoIsoTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                self?.adjustIsoTowardsTarget()
+            }
+        }
+    }
+
+    private func stopAutoIsoLoop() {
+        DispatchQueue.main.async { [weak self] in
+            self?.autoIsoTimer?.invalidate()
+            self?.autoIsoTimer = nil
+            print("⏸ [AutoISO] 停止闭环 ISO 调整")
+        }
+    }
+
+    /// 闭环算法: 按 EV 偏差调整 ISO, 保持快门不变
+    private func adjustIsoTowardsTarget() {
+        guard autoIsoEnabled else { return }
+        guard let device = getCurrentCaptureDevice() else { return }
+
+        let offset = device.exposureTargetOffset  // 单位 EV: 负=过亮, 正=过暗
+        // 死区 0.3 EV 内不动, 避免抖动
+        if abs(offset) < 0.3 { return }
+
+        let currentISO = device.iso
+        // EV → ISO 倍数: 1 EV = 2x. 但每次只走一半步长, 避免过冲
+        let factor = pow(2.0, Double(offset) * 0.5)
+        let newISO = Float(Double(currentISO) * factor)
+
+        let minISO = device.activeFormat.minISO
+        let maxISO = device.activeFormat.maxISO
+        let clampedISO = max(minISO, min(maxISO, newISO))
+
+        // 变化不到 5% 就懒得调
+        if abs(clampedISO - currentISO) < (maxISO - minISO) * 0.05 { return }
+
+        do {
+            try device.lockForConfiguration()
+            // ⭐ 保持 duration (快门) 不变, 只动 ISO
+            device.setExposureModeCustom(
+                duration: device.exposureDuration,
+                iso: clampedISO,
+                completionHandler: nil
+            )
+            device.unlockForConfiguration()
+            print("🔄 [AutoISO] EV=\(String(format: "%+.2f", offset)), ISO: \(Int(currentISO)) → \(Int(clampedISO)) (范围 \(Int(minISO))-\(Int(maxISO)))")
+        } catch {
+            print("❌ [AutoISO] 调整失败: \(error.localizedDescription)")
+        }
+    }
+
     /// 获取当前采集设备
     private func getCurrentCaptureDevice() -> AVCaptureDevice? {
         guard let session = capturer?.captureSession else { return nil }
@@ -2040,6 +2104,26 @@ final class WebRTCManager: NSObject, ObservableObject {
     // 🔥 快门速度值（后端下发 60-600，直接应用）
     // 60 = 1/60s, 600 = 1/600s
     @Published var cjfpsValue: Int = 240  // 默认 1/240s
+
+    // ⭐ 自动 ISO 闭环开关 (S 档: 快门固定, ISO 跟随光线)
+    //   ON: 监听 device.exposureTargetOffset, 每秒调一次 ISO 让 EV→0
+    //   OFF: ISO 固定在 setCaptureFrameRate 算的中位值 (max-min)/2
+    @Published var autoIsoEnabled: Bool = false {
+        didSet {
+            if oldValue == autoIsoEnabled { return }
+            if autoIsoEnabled {
+                startAutoIsoLoop()
+            } else {
+                stopAutoIsoLoop()
+                // 关闭时立即按当前快门重新应用一次, 让 ISO 回到中位
+                let cj = cjfpsValue
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    self?.setCaptureFrameRate(shutterSpeed: cj, forceApply: true)
+                }
+            }
+        }
+    }
+    private var autoIsoTimer: Timer?
 
     // 统计 & 自适应
     private var statsTimer: Timer?
@@ -3312,12 +3396,17 @@ final class WebRTCManager: NSObject, ObservableObject {
                 let minISO = device.activeFormat.minISO
                 let maxISO = device.activeFormat.maxISO
                 // 使用 1/3 位置的 ISO，提供正常亮度
-                // ⭐ 亮度方案 1: 把 ISO 从 1/3 位上调到 1/2 位（亮约 1 档）
-                //   背景: 同款相机同等距离, 竞品画面偏亮; 主因是 ISO 锁低位过暗。
-                //   只动 ISO 不动 duration, 快门(cjfpsValue) 链路不受影响。
-                let fixedISO = minISO + (maxISO - minISO) / 2
+                // ⭐ ISO 选择:
+                //   autoIsoEnabled=true  → 用当前 device.iso (闭环 timer 已在持续调整, 别覆盖它)
+                //   autoIsoEnabled=false → 中位 ISO (max-min)/2, 比之前 1/3 位亮 1 档
+                let fixedISO: Float
+                if autoIsoEnabled {
+                    fixedISO = device.iso       // 保留闭环值, 后续 timer 会继续微调
+                } else {
+                    fixedISO = minISO + (maxISO - minISO) / 2
+                }
                 device.setExposureModeCustom(duration: safeDuration, iso: fixedISO, completionHandler: nil)
-                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO)(中位,范围\(minISO)-\(maxISO))")
+                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO) [\(autoIsoEnabled ? "auto闭环" : "中位")] 范围\(minISO)-\(maxISO)")
                 
                 // 🔥🔥 关键：显式锁定帧率，防止手动曝光后帧率被自动降低
                 // 直接使用 currentCaptureFPS（在 startCapture 前已正确设置）

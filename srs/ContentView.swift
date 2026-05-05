@@ -384,12 +384,31 @@ struct SettingsPanelView: View {
                     range: -2...8,
                     displayText: String(format: "%.2f", brightnessValue)
                 )
-                
+
                 // 分隔线
                 Rectangle()
                     .fill(Color.white)
                     .frame(height: 1)
-                
+
+                // ⭐ 自动 ISO 开关 (S 档: 快门固定, ISO 跟随光线)
+                HStack {
+                    Text("自动亮度")
+                        .foregroundColor(.gray)
+                        .font(.system(size: 14))
+                    Spacer()
+                    Toggle("", isOn: $rtc.autoIsoEnabled)
+                        .labelsHidden()
+                        .toggleStyle(SwitchToggleStyle(tint: .blue))
+                        .scaleEffect(0.8)
+                }
+                .padding(.horizontal, 18)
+                .frame(height: 28)
+
+                // 分隔线
+                Rectangle()
+                    .fill(Color.white)
+                    .frame(height: 1)
+
                 // 档位选择（仅 UI 效果，不实际调用，与后端同步）
                 HStack(spacing: 12) {
                         QualityRadioButton(

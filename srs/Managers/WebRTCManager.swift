@@ -545,13 +545,18 @@ final class WebRTCManager: NSObject, ObservableObject {
     private var nwPathMonitorStarted = false
     /// 因 ICE 失败被加入"对方 NAT 不友好"黑名单的 pcDeviceId，下次重试强制 relay
     private var forceRelayPeerIds: Set<String> = []
-    /// 综合判断本次连接是否应该 forceRelay。考虑 3 个信号：
+    /// PC 在 WEBRTC_REQUEST 中上报的网络类型: "ethernet"/"wifi"/"cellular"/"unknown"
+    /// 任一端是 cellular 就走 relay (CGNAT/Symmetric NAT 直连必败)
+    private var peerNetworkType: [String: String] = [:]
+    /// 综合判断本次连接是否应该 forceRelay。考虑 4 个信号:
     ///   1. 后台下发的 forceRelay 总开关
-    ///   2. 本机走蜂窝网（CGNAT，必败）
-    ///   3. 该 pc 之前 ICE 失败被加入黑名单
+    ///   2. 本机走蜂窝网 (CGNAT, 必败)
+    ///   3. 对端 PC 上报走蜂窝 (CGNAT, 必败)
+    ///   4. 该 pc 之前 ICE 失败被加入黑名单
     private func effectiveForceRelay(for pcDeviceId: String) -> Bool {
         return forceRelay
             || isOnCellular
+            || (peerNetworkType[pcDeviceId] == "cellular")
             || forceRelayPeerIds.contains(pcDeviceId)
     }
 
@@ -2904,13 +2909,15 @@ final class WebRTCManager: NSObject, ObservableObject {
         cfg.continualGatheringPolicy = .gatherContinually
         cfg.iceBackupCandidatePairPingInterval = 2000
         cfg.iceCandidatePoolSize = 2
-        // ⭐ 综合判断 forceRelay: 后台开关 OR 蜂窝网 OR 该 pc 上次 ICE 失败黑名单
+        // ⭐ 综合判断 forceRelay: 后台开关 OR 本机蜂窝 OR 对端蜂窝 OR ICE 失败黑名单
         let useRelay = effectiveForceRelay(for: pcDeviceId)
         cfg.iceTransportPolicy = useRelay ? .relay : .all
         if useRelay {
+            let peerType = peerNetworkType[pcDeviceId] ?? "unknown"
             let reason = forceRelay ? "后台开关"
-                       : (isOnCellular ? "蜂窝网络(CGNAT)"
-                       : "ICE 失败黑名单")
+                       : (isOnCellular ? "本机蜂窝(CGNAT)"
+                       : (peerType == "cellular" ? "对端PC蜂窝(CGNAT)"
+                       : "ICE 失败黑名单"))
             print("⚠️ [P2P] 强制中继模式: pc=\(pcDeviceId), 原因=\(reason)")
         }
         cfg.bundlePolicy = .maxBundle
@@ -3024,6 +3031,7 @@ final class WebRTCManager: NSObject, ObservableObject {
             pendingRemoteIceCandidates.removeValue(forKey: pcDeviceId)  // ★ 清理缓存 ICE
             forceRelayPeerIds.remove(pcDeviceId)                        // ⭐ 清理 forceRelay 黑名单
             iceRetryCount.removeValue(forKey: pcDeviceId)               // ⭐ 清理 ICE 重试计数
+            peerNetworkType.removeValue(forKey: pcDeviceId)             // ⭐ 清理对端网络类型
             print("🔌 [P2P] 已关闭 PC \(pcDeviceId) 的会话，剩余观看者: \(p2pViewerSessions.count)")
             
             // 如果关闭的是主连接，切换到下一个
@@ -3051,6 +3059,7 @@ final class WebRTCManager: NSObject, ObservableObject {
         pendingRemoteIceCandidates.removeAll()  // ★ 清理所有缓存 ICE
         forceRelayPeerIds.removeAll()           // ⭐ 清理所有 forceRelay 黑名单
         iceRetryCount.removeAll()               // ⭐ 清理所有 ICE 重试计数
+        peerNetworkType.removeAll()             // ⭐ 清理所有对端网络类型
         pc = nil
         videoSender = nil
         isReadyForViewers = false
@@ -5276,6 +5285,10 @@ final class WebRTCManager: NSObject, ObservableObject {
         // ★★★ 新增：PC 请求观看（核心入口）
         case "WEBRTC_REQUEST":
             print("📥 [P2P] 收到 PC \(fromDevice) 的观看请求")
+            // ⭐ 提取 PC 上报的网络类型 (用于 effectiveForceRelay 判断)
+            let pcNetType = (message["networkType"] as? String) ?? "unknown"
+            peerNetworkType[fromDevice] = pcNetType
+            print("📡 [P2P] PC \(fromDevice) 网络类型: \(pcNetType) (本机蜂窝=\(isOnCellular))")
             print("🔔 [P2P-DEBUG] isReadyForViewers=\(isReadyForViewers), localVideoTrack=\(localVideoTrack != nil ? "有" : "nil"), 当前观看者=\(p2pViewerSessions.count)/\(maxP2PViewers)")
             guard isReadyForViewers else {
                 print("⚠️ [P2P] 视频轨道未就绪，拒绝请求")

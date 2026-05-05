@@ -717,6 +717,20 @@ struct ContentView: View {
                     Spacer()
                     
                     VStack(spacing: 10) {
+                        // ⭐ 自动亮度开关 (S 档: 快门固定, ISO 跟随光线)
+                        HStack {
+                            Text("自动亮度")
+                                .font(.system(size: 10))
+                                .foregroundColor(.white)
+                            Spacer()
+                            Toggle("", isOn: $rtc.autoIsoEnabled)
+                                .labelsHidden()
+                                .toggleStyle(SwitchToggleStyle(tint: .blue))
+                                .scaleEffect(0.7)
+                        }
+                        .padding(.horizontal, 16)
+                        .frame(height: 24)
+
                         // 🔍 屏幕亮度调节
                         BrightnessSliderView()
                             .padding(.horizontal, 16)

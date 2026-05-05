@@ -11,6 +11,8 @@ import AVFoundation
 import Network
 import CoreMedia
 import UIKit
+import CoreImage
+import Metal
 
 // MARK: - iPhone型号检测（iPhone 15+ 48MP新架构需要 1080p 采集）
 // iPhone15,4/5 = iPhone 15 / 15 Plus (majorVersion=15, minorVersion>=4)
@@ -82,10 +84,124 @@ extension Notification.Name {
     static let webrtcSignalingReceived = Notification.Name("webrtcSignalingReceived")
 }
 
+// MARK: - ⭐ 视频滤镜管道 (CIFilter + Metal GPU 后处理)
+//   竞品 看家宝 / Kirin 扒下来确认: 用 Core Image 做 brightness/contrast/saturation/sharpness 后处理
+//   CIInputBrightnessKey / CIInputContrastKey / CIInputSaturationKey / CIInputSharpnessKey
+//   我方对齐: 在 FrameThrottler 把 YUV 帧推给 WebRTC 编码器之前, 先过一遍 CIFilter.
+//   GPU 路径(Metal)开销 1-2ms/帧 (1080p@30fps), iPhone 12+ 几乎无感.
+final class VideoFilterPipeline {
+    // 默认值参考竞品观感: 轻微提亮 + 加对比 + 加饱和 + 中等锐化
+    var brightness: Float = 0.10   // -1.0 ~ 1.0   (0 不变)
+    var contrast: Float = 1.15     //  0.0 ~ 4.0   (1 不变)
+    var saturation: Float = 1.10   //  0.0 ~ 2.0   (1 不变)
+    var sharpness: Float = 0.5     //  0.0 ~ 2.0   (0 不锐化)
+
+    private let ciContext: CIContext
+    private var pixelBufferPool: CVPixelBufferPool?
+    private var poolWidth: Int = 0
+    private var poolHeight: Int = 0
+
+    init() {
+        // Metal 后端 (GPU 渲染)
+        let device = MTLCreateSystemDefaultDevice()
+        let options: [CIContextOption: Any] = [
+            .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
+            .cacheIntermediates: false,
+        ]
+        if let device = device {
+            ciContext = CIContext(mtlDevice: device, options: options)
+        } else {
+            ciContext = CIContext(options: options)
+        }
+    }
+
+    /// 是否启用滤镜 — 任一参数偏离默认值 (中性) 就需要处理, 全中性时直通省 CPU
+    var isPassThrough: Bool {
+        return brightness == 0 && contrast == 1.0 && saturation == 1.0 && sharpness == 0
+    }
+
+    /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败时调用方应使用原帧)
+    func processFrame(_ inputPB: CVPixelBuffer) -> CVPixelBuffer? {
+        if isPassThrough { return nil }
+
+        let width = CVPixelBufferGetWidth(inputPB)
+        let height = CVPixelBufferGetHeight(inputPB)
+        guard width > 0 && height > 0 else { return nil }
+
+        // 重建 / 复用 pixel buffer 池
+        if pixelBufferPool == nil || poolWidth != width || poolHeight != height {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                kCVPixelBufferMetalCompatibilityKey: true,
+            ]
+            var pool: CVPixelBufferPool?
+            let poolAttrs: [CFString: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey: 4
+            ]
+            CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                    poolAttrs as CFDictionary,
+                                    attrs as CFDictionary,
+                                    &pool)
+            pixelBufferPool = pool
+            poolWidth = width
+            poolHeight = height
+        }
+        guard let pool = pixelBufferPool else { return nil }
+
+        var ciImage = CIImage(cvPixelBuffer: inputPB)
+
+        // 1. 颜色控制 (亮度 / 对比度 / 饱和度) — 单 filter 一次过
+        if brightness != 0 || contrast != 1.0 || saturation != 1.0 {
+            if let f = CIFilter(name: "CIColorControls") {
+                f.setValue(ciImage, forKey: kCIInputImageKey)
+                f.setValue(NSNumber(value: brightness), forKey: kCIInputBrightnessKey)
+                f.setValue(NSNumber(value: contrast),   forKey: kCIInputContrastKey)
+                f.setValue(NSNumber(value: saturation), forKey: kCIInputSaturationKey)
+                if let out = f.outputImage { ciImage = out }
+            }
+        }
+
+        // 2. 亮度锐化 (只锐化 Y 通道, 不影响色彩)
+        if sharpness > 0 {
+            if let f = CIFilter(name: "CISharpenLuminance") {
+                f.setValue(ciImage, forKey: kCIInputImageKey)
+                f.setValue(NSNumber(value: sharpness), forKey: kCIInputSharpnessKey)
+                if let out = f.outputImage { ciImage = out }
+            }
+        }
+
+        // 3. 输出到新的 CVPixelBuffer (BGRA)
+        var outputPB: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputPB)
+        guard let out = outputPB else { return nil }
+        ciContext.render(ciImage, to: out)
+        return out
+    }
+}
+
 // MARK: - 帧节流器（整除跳帧算法：确保帧时间戳等差分布）
 final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
     weak var inner: RTCVideoCapturerDelegate?           // 🔥 推送输出（受后端fps控制）
     weak var previewDelegate: RTCVideoCapturerDelegate? // 🔥 预览输出（固定60fps）
+    var videoFilter: VideoFilterPipeline?               // ⭐ 视频后处理滤镜 (CIFilter, GPU)
+
+    /// 应用后处理滤镜 — 滤镜空 / 直通模式时返回原 buffer (零开销)
+    /// 注意: WebRTC RTCCVPixelBuffer 包装的是 NV12 (kCVPixelFormatType_420YpCbCr8BiPlanar...) ,
+    /// CIFilter 处理后输出 BGRA, 编码器能接受 BGRA 直接编 H264.
+    private func applyFilter(_ frame: RTCVideoFrame) -> RTCVideoFrame {
+        guard let filter = videoFilter, !filter.isPassThrough else { return frame }
+        guard let cvBuffer = (frame.buffer as? RTCCVPixelBuffer)?.pixelBuffer else { return frame }
+        guard let processed = filter.processFrame(cvBuffer) else { return frame }
+        let newBuffer = RTCCVPixelBuffer(pixelBuffer: processed)
+        return RTCVideoFrame(
+            buffer: newBuffer,
+            rotation: frame.rotation,
+            timeStampNs: frame.timeStampNs
+        )
+    }
     
     // 🔥 推送FPS硬上限
     private let maxAllowedFps: Int = 60
@@ -358,42 +474,44 @@ final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
     // 🔥 发送到预览
     private func sendPreviewFrame(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
         previewSentCounter += 1
-        
+
+        // ⭐ 滤镜后处理 (亮度/对比度/饱和度/锐度); 直通模式开销近 0
+        let filtered = applyFilter(videoFrame)
         let fixedFrame = RTCVideoFrame(
-            buffer: videoFrame.buffer,
+            buffer: filtered.buffer,
             rotation: ._0,
             timeStampNs: videoFrame.timeStampNs
         )
         previewDelegate?.capturer(capturer, didCapture: fixedFrame)
     }
-    
+
     // 🔥 发送到推送（使用 90k RTP 时钟，无累积误差）
     private func sendFrameWithArithmeticTimestamp(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
         sentCounter += 1
         diagPushCount += 1  // 🔥 诊断：实际喂给 WebRTC 的帧数
-        
+
         // 🔥 方案B：90k RTP 时钟 → 纳秒
-        // timestampNs = rtp90kTimestamp * 1_000_000_000 / 90_000
-        // 简化：timestampNs = rtp90kTimestamp * 100_000 / 9
         let timestampNs = rtp90kTimestamp * 1_000_000_000 / rtpClockRate
-        
-        // 步进 90k 时钟（每帧固定步进，如60fps每帧+1500）
         rtp90kTimestamp += rtp90kStep
-        
+
+        // ⭐ 滤镜后处理
+        let filtered = applyFilter(videoFrame)
         let fixedFrame = RTCVideoFrame(
-            buffer: videoFrame.buffer,
+            buffer: filtered.buffer,
             rotation: ._0,
-            timeStampNs: timestampNs  // 🔥 使用 90k 转换的纳秒时间戳
+            timeStampNs: timestampNs
         )
         inner?.capturer(capturer, didCapture: fixedFrame)
     }
-    
+
     // 🔥 发送到推送（保留原始时间戳，备用）
     private func sendFrame(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
         sentCounter += 1
-        
+
+        // ⭐ 滤镜后处理
+        let filtered = applyFilter(videoFrame)
         let fixedFrame = RTCVideoFrame(
-            buffer: videoFrame.buffer,
+            buffer: filtered.buffer,
             rotation: ._0,
             timeStampNs: videoFrame.timeStampNs
         )
@@ -567,6 +685,8 @@ final class WebRTCManager: NSObject, ObservableObject {
     
     private var localVideoTrack: RTCVideoTrack?
     private var frameThrottler: FrameThrottler?
+    /// ⭐ 视频后处理滤镜 (CIFilter, GPU). 所有 FrameThrottler 共享同一份, 修改参数立即生效.
+    let videoFilter = VideoFilterPipeline()
     
     
     // MARK: - 动态档位计算
@@ -987,6 +1107,7 @@ final class WebRTCManager: NSObject, ObservableObject {
                 throttler.previewDelegate = self.previewVideoSource  // 🔥 预览输出（固定60fps）
                 throttler.captureFps = currentCaptureFPS             // 🔥 设置采集FPS
                 throttler.targetSendFps = targetOutputFPS            // 🔥 设置推送FPS
+                throttler.videoFilter = videoFilter                  // ⭐ 挂上视频后处理滤镜
                 frameThrottler = throttler
                 print("🔄 [enableAverageThrottling] 创建新节流器，采集=\(currentCaptureFPS)fps，推送=\(targetOutputFPS)fps，预览=60fps")
             }
@@ -1594,6 +1715,7 @@ final class WebRTCManager: NSObject, ObservableObject {
                         throttler.previewDelegate = self.previewVideoSource  // 🔥 预览输出（固定60fps）
                         throttler.captureFps = self.currentCaptureFPS   // 🔥 设置采集FPS（整除跳帧）
                         throttler.targetSendFps = self.targetOutputFPS  // 🔥 设置推送FPS
+                        throttler.videoFilter = self.videoFilter        // ⭐ 挂上视频后处理滤镜
                         throttler.fpsReportHandler = { [weak self] cap, snd in
                                 self?.currentCaptureFps = cap
                                 self?.currentSendFps = snd
@@ -2730,6 +2852,7 @@ final class WebRTCManager: NSObject, ObservableObject {
             throttler.previewDelegate = previewVideoSource   // 🔥 预览输出（固定60fps）
             throttler.captureFps = currentCaptureFPS         // 🔥 设置采集FPS（整除跳帧）
             throttler.targetSendFps = self.targetOutputFPS   // 🔥 设置推送FPS
+            throttler.videoFilter = self.videoFilter         // ⭐ 挂上视频后处理滤镜
             throttler.fpsReportHandler = { [weak self] cap, snd in
                     self?.currentCaptureFps = cap
                     self?.currentSendFps = snd

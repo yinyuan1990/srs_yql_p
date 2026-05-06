@@ -31,6 +31,7 @@ struct ThinRemoteConfig: Codable {
     var blackPoint: Float?      // 黑场压死
     var redGlow: Float?         // 红色发光强度
     var highlightLift: Float?   // 高光提亮
+    var gamma: Float?           // 伽马 0.5..2.0, pow 曲线
     var filterEnabled: Bool?    // 滤镜主开关
 
     let lastUpdated: String?
@@ -56,6 +57,7 @@ struct ThinRemoteConfig: Codable {
         case blackPoint
         case redGlow
         case highlightLift
+        case gamma
         case filterEnabled
         case lastUpdated = "last_updated"
         case updatedBy = "updated_by"
@@ -107,6 +109,7 @@ struct ThinRemoteConfig: Codable {
         blackPoint = try container.decodeIfPresent(Float.self, forKey: .blackPoint)
         redGlow = try container.decodeIfPresent(Float.self, forKey: .redGlow)
         highlightLift = try container.decodeIfPresent(Float.self, forKey: .highlightLift)
+        gamma = try container.decodeIfPresent(Float.self, forKey: .gamma)
         filterEnabled = try container.decodeIfPresent(Bool.self, forKey: .filterEnabled)
         lastUpdated = try container.decodeIfPresent(String.self, forKey: .lastUpdated)
         updatedBy = try container.decodeIfPresent(String.self, forKey: .updatedBy)
@@ -135,6 +138,7 @@ struct ThinRemoteConfig: Codable {
         self.blackPoint = nil
         self.redGlow = nil
         self.highlightLift = nil
+        self.gamma = nil
         self.filterEnabled = nil
         self.lastUpdated = nil
         self.updatedBy = nil

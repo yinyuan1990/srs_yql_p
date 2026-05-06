@@ -124,6 +124,12 @@ final class VideoFilterPipeline: ObservableObject {
     @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.05) {
         didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
     }
+    /// 伽马: pow 曲线 rgb' = rgb^(1/gamma), 0.5..2.0, 保端点
+    /// 1.0 = 不变, > 1 抬暗部 (♠♣ 花纹更清晰), < 1 压暗部 (黑更死)
+    /// 与 brightness 形状不同 (parabolic vs power), 对暗部更敏感
+    @Published var gamma: Float = VideoFilterPipeline.loadDefault(.gamma, fallback: 1.0) {
+        didSet { saveDefault(.gamma, gamma); if oldValue != gamma { logChange("gamma", gamma) } }
+    }
     /// 对比度: 绕 0.5 中点拉. 1.0 = 不变, 1.20 = 显著但不死
     @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.20) {
         didSet { saveDefault(.contrast, contrast); if oldValue != contrast { logChange("contrast", contrast) } }
@@ -160,6 +166,7 @@ final class VideoFilterPipeline: ObservableObject {
         case blackPoint    = "videoFilter.blackPoint"
         case redGlow       = "videoFilter.redGlow"
         case highlightLift = "videoFilter.highlightLift"
+        case gamma         = "videoFilter.gamma"
     }
 
     private static func loadDefault(_ key: Key, fallback: Float) -> Float {
@@ -182,6 +189,7 @@ final class VideoFilterPipeline: ObservableObject {
     func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
                   sharpness: Float?, redBoost: Float? = nil,
                   blackPoint: Float? = nil, redGlow: Float? = nil, highlightLift: Float? = nil,
+                  gamma: Float? = nil,
                   enabled: Bool? = nil, source: String = "remote") {
         if let v = brightness { self.brightness = v }
         if let v = contrast   { self.contrast   = v }
@@ -192,8 +200,9 @@ final class VideoFilterPipeline: ObservableObject {
         if let v = redGlow    { self.redGlow    = v }
         if let v = blackPoint { self.blackPoint = v }
         if let v = highlightLift { self.highlightLift = v }
+        if let v = gamma      { self.gamma      = v }
         if let v = enabled    { self.enabled    = v }
-        print("📷 [Filter] 批量应用 (\(source)): bp=\(self.blackPoint) bright=\(self.brightness) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
+        print("📷 [Filter] 批量应用 (\(source)): bp=\(self.blackPoint) bright=\(self.brightness) gamma=\(self.gamma) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
     }
 
     // ===== Metal CIColorKernel: 一次 dispatch 完成所有色彩运算 =====
@@ -202,6 +211,7 @@ final class VideoFilterPipeline: ObservableObject {
     kernel vec4 cardEnhance(__sample s,
                             float blackPoint,
                             float brightness,
+                            float gamma,
                             float contrast,
                             float saturation,
                             float redGlow,
@@ -216,20 +226,25 @@ final class VideoFilterPipeline: ObservableObject {
         //    brightness > 0 提亮中调, < 0 压暗中调, = 0 无变化
         rgb = rgb + brightness * rgb * (1.0 - rgb);
 
-        // 3. 饱和度: Rec.601 luma 加权混合
+        // 3. 伽马: pow 曲线 rgb^(1/gamma), 保端点
+        //    gamma > 1 提暗部 (♠♣ 花纹更亮), < 1 压暗部, = 1 无变化
+        float invGamma = 1.0 / max(gamma, 0.01);
+        rgb = pow(max(rgb, vec3(0.0)), vec3(invGamma));
+
+        // 4. 饱和度: Rec.601 luma 加权混合
         float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
         rgb = mix(vec3(luma), rgb, saturation);
 
-        // 4. 对比度: 绕中点 0.5
+        // 5. 对比度: 绕中点 0.5
         rgb = (rgb - 0.5) * contrast + 0.5;
 
-        // 5. 红色发光: 仅 "R 高 且 G/B 低" 的纯红像素 (♥♦), 非线性推向 1.0
+        // 6. 红色发光: 仅 "R 高 且 G/B 低" 的纯红像素 (♥♦), 非线性推向 1.0
         //    黑色 (R≈0) 和白色 (R≈G≈B) 不受影响
         float gbMax = max(rgb.g, rgb.b);
         float redMask = smoothstep(0.4, 0.7, rgb.r) * max(0.0, 1.0 - gbMax);
         rgb.r = rgb.r + redGlow * redMask * (1.0 - rgb.r);
 
-        // 6. 高光提亮: > 0.7 的通道非线性推向 1.0
+        // 7. 高光提亮: > 0.7 的通道非线性推向 1.0
         vec3 highlightMask = smoothstep(vec3(0.7), vec3(1.0), rgb);
         rgb = rgb + highlightLift * highlightMask * (1.0 - rgb);
 
@@ -271,8 +286,8 @@ final class VideoFilterPipeline: ObservableObject {
     var isPassThrough: Bool {
         if !enabled { return true }
         if cardEnhanceKernel == nil { return true }
-        return blackPoint == 0 && brightness == 0 && contrast == 1.0 && saturation == 1.0
-            && redGlow == 0 && highlightLift == 0
+        return blackPoint == 0 && brightness == 0 && gamma == 1.0 && contrast == 1.0
+            && saturation == 1.0 && redGlow == 0 && highlightLift == 0
     }
 
     /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败/直通时调用方使用原帧)
@@ -308,7 +323,7 @@ final class VideoFilterPipeline: ObservableObject {
         // 单 pass: 所有色彩运算在一次 GPU dispatch 内完成
         let outImage = kernel.apply(
             extent: ciImage.extent,
-            arguments: [ciImage, blackPoint, brightness, contrast, saturation, redGlow, highlightLift]
+            arguments: [ciImage, blackPoint, brightness, gamma, contrast, saturation, redGlow, highlightLift]
         )
         guard let result = outImage else { return nil }
 
@@ -1119,6 +1134,7 @@ final class WebRTCManager: NSObject, ObservableObject {
             blackPoint:    (info["blackPoint"]    as? NSNumber)?.floatValue,
             redGlow:       (info["redGlow"]       as? NSNumber)?.floatValue,
             highlightLift: (info["highlightLift"] as? NSNumber)?.floatValue,
+            gamma:         (info["gamma"]         as? NSNumber)?.floatValue,
             enabled:       info["enabled"] as? Bool,
             source:        (info["source"] as? String) ?? "notification"
         )
@@ -1577,7 +1593,7 @@ final class WebRTCManager: NSObject, ObservableObject {
         // ⭐ v3 滤镜直推 — STOMP 一跳到位, 替代旧的 HTTP→后端→STOMP 三跳
         //   PC sendConfigUpdate("brightness", {"brightness": v}) 直接到这里
         case "brightness", "contrast", "saturation", "sharpness", "redBoost",
-             "blackPoint", "redGlow", "highlightLift", "filterEnabled":
+             "blackPoint", "redGlow", "highlightLift", "gamma", "filterEnabled":
             videoFilter.applyAll(
                 brightness:    cfg.brightness,
                 contrast:      cfg.contrast,
@@ -1587,6 +1603,7 @@ final class WebRTCManager: NSObject, ObservableObject {
                 blackPoint:    cfg.blackPoint,
                 redGlow:       cfg.redGlow,
                 highlightLift: cfg.highlightLift,
+                gamma:         cfg.gamma,
                 enabled:       cfg.filterEnabled,
                 source:        "stomp:\(cfg.ptype)"
             )

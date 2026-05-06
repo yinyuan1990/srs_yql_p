@@ -127,6 +127,12 @@ struct LoginResponse: Codable {
     let forceRelay: Bool?         // ★ 强制走 TURN 中继（后台测试开关）
     let iceServers: [IceServer]?  // ★ ICE 服务器列表（含 STUN/TURN）
     let maxP2PViewers: Int?       // ★ 最大 P2P 同时观看人数
+    // ⭐ 视频滤镜配置（后端可下发, iOS 首次登录覆盖本地默认）
+    let filterEnabled: Bool?
+    let filterBrightness: Float?
+    let filterContrast: Float?
+    let filterSaturation: Float?
+    let filterSharpness: Float?
 }
 
 

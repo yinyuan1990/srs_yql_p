@@ -575,6 +575,26 @@ extension WebSocketManager: SwiftStompDelegate {
             if let cmd = msgDict?["cmd"] as? String, cmd == "set_fps" {
                 handleSetFpsCommand(messageDict: msgDict)
             }
+
+            // ⭐ 处理 PC 端推送的视频滤镜热更新
+            //   协议: { "cmd": "set_filter", "brightness": 0.1, "contrast": 1.15,
+            //           "saturation": 1.10, "sharpness": 0.5, "enabled": true }
+            if let cmd = msgDict?["cmd"] as? String, cmd == "set_filter" {
+                var info: [String: Any] = ["source": "pc_push"]
+                if let v = msgDict?["brightness"] as? NSNumber { info["brightness"] = v }
+                if let v = msgDict?["contrast"]   as? NSNumber { info["contrast"]   = v }
+                if let v = msgDict?["saturation"] as? NSNumber { info["saturation"] = v }
+                if let v = msgDict?["sharpness"]  as? NSNumber { info["sharpness"]  = v }
+                if let v = msgDict?["enabled"]    as? Bool     { info["enabled"]    = v }
+                print("🎨 [set_filter] PC 推送滤镜参数: \(info)")
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: NSNotification.Name("videoFilterUpdated"),
+                        object: nil,
+                        userInfo: info
+                    )
+                }
+            }
             
         }
         // ★ P2P: 处理 WebRTC 信令消息

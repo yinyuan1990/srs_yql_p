@@ -528,6 +528,28 @@ struct MonitorLoginView: View {
                         UserDefaults.standard.set(maxViewers, forKey: "maxP2PViewers")
                         print("🔄 [Login] maxP2PViewers = \(maxViewers)")
                     }
+
+                    // ⭐ 视频滤镜参数（后端下发覆盖本地默认）
+                    //   持久化到 UserDefaults + 发通知让正在跑的 WebRTCManager.videoFilter 立即更新
+                    var filterPayload: [String: Any] = [:]
+                    if let v = loginResponse.filterEnabled    { filterPayload["enabled"]    = v;
+                        UserDefaults.standard.set(v, forKey: "videoFilter.enabled") }
+                    if let v = loginResponse.filterBrightness { filterPayload["brightness"] = v;
+                        UserDefaults.standard.set(v, forKey: "videoFilter.brightness") }
+                    if let v = loginResponse.filterContrast   { filterPayload["contrast"]   = v;
+                        UserDefaults.standard.set(v, forKey: "videoFilter.contrast") }
+                    if let v = loginResponse.filterSaturation { filterPayload["saturation"] = v;
+                        UserDefaults.standard.set(v, forKey: "videoFilter.saturation") }
+                    if let v = loginResponse.filterSharpness  { filterPayload["sharpness"]  = v;
+                        UserDefaults.standard.set(v, forKey: "videoFilter.sharpness") }
+                    if !filterPayload.isEmpty {
+                        print("🔄 [Login] 视频滤镜下发: \(filterPayload)")
+                        NotificationCenter.default.post(
+                            name: NSNotification.Name("videoFilterUpdated"),
+                            object: nil,
+                            userInfo: filterPayload
+                        )
+                    }
                     
                     loginStep = .connecting
                 }

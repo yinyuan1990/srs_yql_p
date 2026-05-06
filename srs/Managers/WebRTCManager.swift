@@ -85,42 +85,101 @@ extension Notification.Name {
 }
 
 // MARK: - ⭐ 视频滤镜管道 (CIFilter + Metal GPU 后处理)
-//   竞品 看家宝 / Kirin 扒下来确认: 用 Core Image 做 brightness/contrast/saturation/sharpness 后处理
+//   竞品 看家宝 / Kirin 扒出来确认: 用 Core Image 做 brightness/contrast/saturation/sharpness 后处理
 //   CIInputBrightnessKey / CIInputContrastKey / CIInputSaturationKey / CIInputSharpnessKey
-//   我方对齐: 在 FrameThrottler 把 YUV 帧推给 WebRTC 编码器之前, 先过一遍 CIFilter.
-//   GPU 路径(Metal)开销 1-2ms/帧 (1080p@30fps), iPhone 12+ 几乎无感.
-final class VideoFilterPipeline {
-    // 默认值参考竞品观感: 轻微提亮 + 加对比 + 加饱和 + 中等锐化
-    var brightness: Float = 0.10   // -1.0 ~ 1.0   (0 不变)
-    var contrast: Float = 1.15     //  0.0 ~ 4.0   (1 不变)
-    var saturation: Float = 1.10   //  0.0 ~ 2.0   (1 不变)
-    var sharpness: Float = 0.5     //  0.0 ~ 2.0   (0 不锐化)
+//
+// v2 优化（解决发热）:
+//   1. CIFilter 实例缓存（一次创建, 反复 setValue, 不每帧 alloc）
+//   2. ObservableObject 暴露给 SwiftUI, UI 滑块可热绑
+//   3. 参数变化时打印, 便于诊断
+//   4. UserDefaults 持久化 + 登录响应/STOMP 推送动态更新
+final class VideoFilterPipeline: ObservableObject {
 
+    // 默认值参考竞品观感, 通过 UserDefaults 持久化, 后端可推送覆盖
+    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.10) {
+        didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
+    }
+    @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.15) {
+        didSet { saveDefault(.contrast, contrast); if oldValue != contrast { logChange("contrast", contrast) } }
+    }
+    @Published var saturation: Float = VideoFilterPipeline.loadDefault(.saturation, fallback: 1.10) {
+        didSet { saveDefault(.saturation, saturation); if oldValue != saturation { logChange("saturation", saturation) } }
+    }
+    @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.5) {
+        didSet { saveDefault(.sharpness, sharpness); if oldValue != sharpness { logChange("sharpness", sharpness) } }
+    }
+
+    // ⭐ 主开关. UI / 后端可关掉整个滤镜让画面恢复原生 (省电省热, 排查问题用)
+    @Published var enabled: Bool = UserDefaults.standard.object(forKey: "videoFilter.enabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(enabled, forKey: "videoFilter.enabled"); print("📷 [Filter] enabled=\(enabled)") }
+    }
+
+    private enum Key: String {
+        case brightness = "videoFilter.brightness"
+        case contrast   = "videoFilter.contrast"
+        case saturation = "videoFilter.saturation"
+        case sharpness  = "videoFilter.sharpness"
+    }
+
+    private static func loadDefault(_ key: Key, fallback: Float) -> Float {
+        if UserDefaults.standard.object(forKey: key.rawValue) != nil {
+            return UserDefaults.standard.float(forKey: key.rawValue)
+        }
+        return fallback
+    }
+    private func saveDefault(_ key: Key, _ value: Float) {
+        UserDefaults.standard.set(value, forKey: key.rawValue)
+    }
+    private func logChange(_ name: String, _ v: Float) {
+        print("📷 [Filter] \(name) = \(String(format: "%.3f", v))")
+    }
+
+    // ⭐ 一次性批量更新（避免 4 次 didSet 触发）
+    func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
+                  sharpness: Float?, enabled: Bool? = nil, source: String = "remote") {
+        if let v = brightness { self.brightness = v }
+        if let v = contrast   { self.contrast   = v }
+        if let v = saturation { self.saturation = v }
+        if let v = sharpness  { self.sharpness  = v }
+        if let v = enabled    { self.enabled    = v }
+        print("📷 [Filter] 批量应用 (\(source)): bright=\(brightness ?? self.brightness) contrast=\(contrast ?? self.contrast) sat=\(saturation ?? self.saturation) sharp=\(sharpness ?? self.sharpness) enabled=\(enabled ?? self.enabled)")
+    }
+
+    // ===== 处理管线 =====
     private let ciContext: CIContext
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
 
+    // ⭐ CIFilter 实例缓存 (避免每帧 alloc, 大幅降温)
+    private let colorControlsFilter: CIFilter?
+    private let sharpenFilter: CIFilter?
+
     init() {
-        // Metal 后端 (GPU 渲染)
         let device = MTLCreateSystemDefaultDevice()
         let options: [CIContextOption: Any] = [
             .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
             .cacheIntermediates: false,
+            .useSoftwareRenderer: false,
         ]
         if let device = device {
             ciContext = CIContext(mtlDevice: device, options: options)
         } else {
             ciContext = CIContext(options: options)
         }
+        colorControlsFilter = CIFilter(name: "CIColorControls")
+        sharpenFilter = CIFilter(name: "CISharpenLuminance")
     }
 
-    /// 是否启用滤镜 — 任一参数偏离默认值 (中性) 就需要处理, 全中性时直通省 CPU
+    /// 直通条件:
+    ///   1. enabled = false (主开关关闭)
+    ///   2. 所有参数都是中性值
     var isPassThrough: Bool {
+        if !enabled { return true }
         return brightness == 0 && contrast == 1.0 && saturation == 1.0 && sharpness == 0
     }
 
-    /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败时调用方应使用原帧)
+    /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败/直通时调用方使用原帧)
     func processFrame(_ inputPB: CVPixelBuffer) -> CVPixelBuffer? {
         if isPassThrough { return nil }
 
@@ -128,7 +187,6 @@ final class VideoFilterPipeline {
         let height = CVPixelBufferGetHeight(inputPB)
         guard width > 0 && height > 0 else { return nil }
 
-        // 重建 / 复用 pixel buffer 池
         if pixelBufferPool == nil || poolWidth != width || poolHeight != height {
             let attrs: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
@@ -137,14 +195,11 @@ final class VideoFilterPipeline {
                 kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
                 kCVPixelBufferMetalCompatibilityKey: true,
             ]
+            let poolAttrs: [CFString: Any] = [kCVPixelBufferPoolMinimumBufferCountKey: 4]
             var pool: CVPixelBufferPool?
-            let poolAttrs: [CFString: Any] = [
-                kCVPixelBufferPoolMinimumBufferCountKey: 4
-            ]
             CVPixelBufferPoolCreate(kCFAllocatorDefault,
                                     poolAttrs as CFDictionary,
-                                    attrs as CFDictionary,
-                                    &pool)
+                                    attrs as CFDictionary, &pool)
             pixelBufferPool = pool
             poolWidth = width
             poolHeight = height
@@ -153,27 +208,23 @@ final class VideoFilterPipeline {
 
         var ciImage = CIImage(cvPixelBuffer: inputPB)
 
-        // 1. 颜色控制 (亮度 / 对比度 / 饱和度) — 单 filter 一次过
-        if brightness != 0 || contrast != 1.0 || saturation != 1.0 {
-            if let f = CIFilter(name: "CIColorControls") {
-                f.setValue(ciImage, forKey: kCIInputImageKey)
-                f.setValue(NSNumber(value: brightness), forKey: kCIInputBrightnessKey)
-                f.setValue(NSNumber(value: contrast),   forKey: kCIInputContrastKey)
-                f.setValue(NSNumber(value: saturation), forKey: kCIInputSaturationKey)
-                if let out = f.outputImage { ciImage = out }
-            }
+        // 1. 颜色控制 (使用缓存的 filter 实例)
+        if (brightness != 0 || contrast != 1.0 || saturation != 1.0), let f = colorControlsFilter {
+            f.setValue(ciImage, forKey: kCIInputImageKey)
+            f.setValue(NSNumber(value: brightness), forKey: kCIInputBrightnessKey)
+            f.setValue(NSNumber(value: contrast),   forKey: kCIInputContrastKey)
+            f.setValue(NSNumber(value: saturation), forKey: kCIInputSaturationKey)
+            if let out = f.outputImage { ciImage = out }
         }
 
-        // 2. 亮度锐化 (只锐化 Y 通道, 不影响色彩)
-        if sharpness > 0 {
-            if let f = CIFilter(name: "CISharpenLuminance") {
-                f.setValue(ciImage, forKey: kCIInputImageKey)
-                f.setValue(NSNumber(value: sharpness), forKey: kCIInputSharpnessKey)
-                if let out = f.outputImage { ciImage = out }
-            }
+        // 2. 亮度锐化
+        if sharpness > 0, let f = sharpenFilter {
+            f.setValue(ciImage, forKey: kCIInputImageKey)
+            f.setValue(NSNumber(value: sharpness), forKey: kCIInputSharpnessKey)
+            if let out = f.outputImage { ciImage = out }
         }
 
-        // 3. 输出到新的 CVPixelBuffer (BGRA)
+        // 3. 渲染到 BGRA 输出
         var outputPB: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputPB)
         guard let out = outputPB else { return nil }
@@ -967,6 +1018,19 @@ final class WebRTCManager: NSObject, ObservableObject {
     
     // MARK: - 🔥 v2.0 PC端自适应FPS指令处理
     
+    /// ⭐ 视频滤镜热更新（登录下发 / STOMP 推送 / UI 滑块）
+    @objc private func onVideoFilterUpdated(_ notification: Notification) {
+        guard let info = notification.userInfo else { return }
+        videoFilter.applyAll(
+            brightness: (info["brightness"] as? NSNumber)?.floatValue,
+            contrast:   (info["contrast"]   as? NSNumber)?.floatValue,
+            saturation: (info["saturation"] as? NSNumber)?.floatValue,
+            sharpness:  (info["sharpness"]  as? NSNumber)?.floatValue,
+            enabled:    info["enabled"] as? Bool,
+            source:     (info["source"] as? String) ?? "notification"
+        )
+    }
+
     /// ⭐ 登录后 iceServers 更新通知处理（修复 WebRTCManager init 早于登录写入 UserDefaults 的时序）
     @objc private func onIceServersUpdated(_ notification: Notification) {
         guard let userInfo = notification.userInfo,
@@ -2460,6 +2524,14 @@ final class WebRTCManager: NSObject, ObservableObject {
                 self,
                 selector: #selector(onIceServersUpdated(_:)),
                 name: NSNotification.Name("iceServersUpdated"),
+                object: nil
+        )
+
+        // ⭐ 监听视频滤镜参数热更新（登录下发 / STOMP 推送）
+        NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onVideoFilterUpdated(_:)),
+                name: NSNotification.Name("videoFilterUpdated"),
                 object: nil
         )
         

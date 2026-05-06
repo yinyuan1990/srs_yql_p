@@ -124,6 +124,13 @@ final class VideoFilterPipeline: ObservableObject {
     @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.05) {
         didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
     }
+    /// 曝光: rgb × 2^EV, -3..+3 stops, 乘法增益
+    /// 0 = 不变, +1 = 双倍 (1 stop), +2 = 4倍, -1 = 半倍
+    /// 把传感器噪声底"伪黑" (0.02~0.05) 乘出来变成可见暗部, 但高光会顶白
+    /// 配合 highlightLift 用: 暗部从噪声中拉起来, 同时保高光不死白
+    @Published var exposure: Float = VideoFilterPipeline.loadDefault(.exposure, fallback: 0.0) {
+        didSet { saveDefault(.exposure, exposure); if oldValue != exposure { logChange("exposure", exposure) } }
+    }
     /// 伽马: pow 曲线 rgb' = rgb^(1/gamma), 0.5..2.0, 保端点
     /// 1.0 = 不变, > 1 抬暗部 (♠♣ 花纹更清晰), < 1 压暗部 (黑更死)
     /// 与 brightness 形状不同 (parabolic vs power), 对暗部更敏感
@@ -167,6 +174,7 @@ final class VideoFilterPipeline: ObservableObject {
         case redGlow       = "videoFilter.redGlow"
         case highlightLift = "videoFilter.highlightLift"
         case gamma         = "videoFilter.gamma"
+        case exposure      = "videoFilter.exposure"
     }
 
     private static func loadDefault(_ key: Key, fallback: Float) -> Float {
@@ -189,7 +197,7 @@ final class VideoFilterPipeline: ObservableObject {
     func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
                   sharpness: Float?, redBoost: Float? = nil,
                   blackPoint: Float? = nil, redGlow: Float? = nil, highlightLift: Float? = nil,
-                  gamma: Float? = nil,
+                  gamma: Float? = nil, exposure: Float? = nil,
                   enabled: Bool? = nil, source: String = "remote") {
         if let v = brightness { self.brightness = v }
         if let v = contrast   { self.contrast   = v }
@@ -201,14 +209,16 @@ final class VideoFilterPipeline: ObservableObject {
         if let v = blackPoint { self.blackPoint = v }
         if let v = highlightLift { self.highlightLift = v }
         if let v = gamma      { self.gamma      = v }
+        if let v = exposure   { self.exposure   = v }
         if let v = enabled    { self.enabled    = v }
-        print("📷 [Filter] 批量应用 (\(source)): bp=\(self.blackPoint) bright=\(self.brightness) gamma=\(self.gamma) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
+        print("📷 [Filter] 批量应用 (\(source)): exp=\(self.exposure) bp=\(self.blackPoint) bright=\(self.brightness) gamma=\(self.gamma) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
     }
 
     // ===== Metal CIColorKernel: 一次 dispatch 完成所有色彩运算 =====
     //   每像素调用一次, GPU 并行, ISP 不参与
     private static let kernelSource: String = """
     kernel vec4 cardEnhance(__sample s,
+                            float exposure,
                             float blackPoint,
                             float brightness,
                             float gamma,
@@ -217,6 +227,11 @@ final class VideoFilterPipeline: ObservableObject {
                             float redGlow,
                             float highlightLift) {
         vec3 rgb = s.rgb;
+
+        // 0. 曝光: rgb × 2^EV, 模拟"传感器多采光"
+        //    EV > 0 提亮, +1 stop = ×2; EV < 0 压暗
+        //    会让传感器噪声底 (0.02~0.05) 也被乘出来 → "黑变亮"
+        rgb = rgb * exp2(exposure);
 
         // 1. 黑场压死: 减 bp 后归一化, < bp 的像素归 0
         float bpDenom = max(1.0 - blackPoint, 0.001);
@@ -286,8 +301,8 @@ final class VideoFilterPipeline: ObservableObject {
     var isPassThrough: Bool {
         if !enabled { return true }
         if cardEnhanceKernel == nil { return true }
-        return blackPoint == 0 && brightness == 0 && gamma == 1.0 && contrast == 1.0
-            && saturation == 1.0 && redGlow == 0 && highlightLift == 0
+        return exposure == 0 && blackPoint == 0 && brightness == 0 && gamma == 1.0
+            && contrast == 1.0 && saturation == 1.0 && redGlow == 0 && highlightLift == 0
     }
 
     /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败/直通时调用方使用原帧)
@@ -323,7 +338,7 @@ final class VideoFilterPipeline: ObservableObject {
         // 单 pass: 所有色彩运算在一次 GPU dispatch 内完成
         let outImage = kernel.apply(
             extent: ciImage.extent,
-            arguments: [ciImage, blackPoint, brightness, gamma, contrast, saturation, redGlow, highlightLift]
+            arguments: [ciImage, exposure, blackPoint, brightness, gamma, contrast, saturation, redGlow, highlightLift]
         )
         guard let result = outImage else { return nil }
 
@@ -1135,6 +1150,7 @@ final class WebRTCManager: NSObject, ObservableObject {
             redGlow:       (info["redGlow"]       as? NSNumber)?.floatValue,
             highlightLift: (info["highlightLift"] as? NSNumber)?.floatValue,
             gamma:         (info["gamma"]         as? NSNumber)?.floatValue,
+            exposure:      (info["exposure"]      as? NSNumber)?.floatValue,
             enabled:       info["enabled"] as? Bool,
             source:        (info["source"] as? String) ?? "notification"
         )
@@ -1593,7 +1609,7 @@ final class WebRTCManager: NSObject, ObservableObject {
         // ⭐ v3 滤镜直推 — STOMP 一跳到位, 替代旧的 HTTP→后端→STOMP 三跳
         //   PC sendConfigUpdate("brightness", {"brightness": v}) 直接到这里
         case "brightness", "contrast", "saturation", "sharpness", "redBoost",
-             "blackPoint", "redGlow", "highlightLift", "gamma", "filterEnabled":
+             "blackPoint", "redGlow", "highlightLift", "gamma", "exposure", "filterEnabled":
             videoFilter.applyAll(
                 brightness:    cfg.brightness,
                 contrast:      cfg.contrast,
@@ -1604,6 +1620,7 @@ final class WebRTCManager: NSObject, ObservableObject {
                 redGlow:       cfg.redGlow,
                 highlightLift: cfg.highlightLift,
                 gamma:         cfg.gamma,
+                exposure:      cfg.exposure,
                 enabled:       cfg.filterEnabled,
                 source:        "stomp:\(cfg.ptype)"
             )

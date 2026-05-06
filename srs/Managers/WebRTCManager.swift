@@ -92,17 +92,22 @@ extension Notification.Name {
 //   v3 把所有色彩运算合到 1 个 CIColorKernel, 单 pass 完成:
 //
 //     1. blackPoint  — 黑场压死 (减后归一化, 真正黑色归 0, 不会变灰)
-//     2. saturation  — Rec.601 luma 加权混合
-//     3. contrast    — 绕中点 0.5 拉
-//     4. redGlow     — 选择性红色发光 (仅 R 高且 G/B 低的纯红区域非线性推向 1.0)
-//     5. highlightLift — 高光提亮 (>0.7 区域非线性推向 1.0, 白色更白)
+//     2. brightness  — 中调亮度曲线 (保端点不会让黑变灰, 只弯中调)
+//     3. saturation  — Rec.601 luma 加权混合
+//     4. contrast    — 绕中点 0.5 拉
+//     5. redGlow     — 选择性红色发光 (仅 R 高且 G/B 低的纯红区域非线性推向 1.0)
+//     6. highlightLift — 高光提亮 (>0.7 区域非线性推向 1.0, 白色更白)
 //
 //   锐化已移除 — 卷积 9 采样开销最贵, ISP 自带 edge enhancement 已够用.
-//   旧字段 brightness / sharpness 保留为 @Published 仅为兼容服务端推送, kernel 不读取.
+//   旧字段 sharpness 保留为 @Published 仅为兼容服务端推送, kernel 不读取.
+//
+//   v3.1: brightness 重新启用, 但用保端点曲线 (rgb + b·rgb·(1-rgb)) 替代 v2 的加法偏移,
+//         拖滑块会有效果但不会把黑色拉灰.
 //
 // 兼容:
 //   - UserDefaults key 不变, UI 滑块继续可绑定
-//   - 服务端 filterBrightness/filterSharpness 推下来不会报错, 只是不生效
+//   - 服务端 filterSharpness 推下来不会报错, 只是不生效
+//   - 服务端 filterBrightness 直接生效 (新算法)
 //   - 服务端 filterRedBoost 推下来转作 redGlow 强度
 final class VideoFilterPipeline: ObservableObject {
 
@@ -112,6 +117,12 @@ final class VideoFilterPipeline: ObservableObject {
     /// 0 = 不动, 0.04 = 暗部下沉 4%, 卡牌黑底/黑桃黑梅花更黑
     @Published var blackPoint: Float = VideoFilterPipeline.loadDefault(.blackPoint, fallback: 0.04) {
         didSet { saveDefault(.blackPoint, blackPoint); if oldValue != blackPoint { logChange("blackPoint", blackPoint) } }
+    }
+    /// 中调亮度: 保端点曲线 rgb + b·rgb·(1-rgb), -1..+1
+    /// 0 = 不变, 0.05 = 中调微提, 0.30 = 中调显著提亮
+    /// 黑场 (rgb=0) 和高光 (rgb=1) 都不受影响, 拖动不会把黑变灰
+    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.05) {
+        didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
     }
     /// 对比度: 绕 0.5 中点拉. 1.0 = 不变, 1.20 = 显著但不死
     @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.20) {
@@ -132,9 +143,6 @@ final class VideoFilterPipeline: ObservableObject {
     }
 
     // ===== 兼容旧服务端推送字段 (kernel 不读取, 留着不报错) =====
-    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.0) {
-        didSet { saveDefault(.brightness, brightness) }
-    }
     @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.0) {
         didSet { saveDefault(.sharpness, sharpness) }
     }
@@ -168,8 +176,9 @@ final class VideoFilterPipeline: ObservableObject {
     }
 
     // ⭐ 一次性批量更新（避免多次 didSet 触发）
-    //   服务端旧字段 brightness/sharpness 透传持久化但不影响 kernel
+    //   服务端旧字段 sharpness 透传持久化但不影响 kernel
     //   服务端旧字段 redBoost 自动映射到 redGlow
+    //   brightness 在 v3.1 重新生效 (中调曲线, 不再加法偏移)
     func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
                   sharpness: Float?, redBoost: Float? = nil,
                   blackPoint: Float? = nil, redGlow: Float? = nil, highlightLift: Float? = nil,
@@ -184,7 +193,7 @@ final class VideoFilterPipeline: ObservableObject {
         if let v = blackPoint { self.blackPoint = v }
         if let v = highlightLift { self.highlightLift = v }
         if let v = enabled    { self.enabled    = v }
-        print("📷 [Filter] 批量应用 (\(source)): bp=\(self.blackPoint) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
+        print("📷 [Filter] 批量应用 (\(source)): bp=\(self.blackPoint) bright=\(self.brightness) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
     }
 
     // ===== Metal CIColorKernel: 一次 dispatch 完成所有色彩运算 =====
@@ -192,6 +201,7 @@ final class VideoFilterPipeline: ObservableObject {
     private static let kernelSource: String = """
     kernel vec4 cardEnhance(__sample s,
                             float blackPoint,
+                            float brightness,
                             float contrast,
                             float saturation,
                             float redGlow,
@@ -202,20 +212,24 @@ final class VideoFilterPipeline: ObservableObject {
         float bpDenom = max(1.0 - blackPoint, 0.001);
         rgb = max(rgb - vec3(blackPoint), vec3(0.0)) / vec3(bpDenom);
 
-        // 2. 饱和度: Rec.601 luma 加权混合
+        // 2. 中调亮度: 保端点曲线, rgb=0 和 rgb=1 不变, 只弯中调
+        //    brightness > 0 提亮中调, < 0 压暗中调, = 0 无变化
+        rgb = rgb + brightness * rgb * (1.0 - rgb);
+
+        // 3. 饱和度: Rec.601 luma 加权混合
         float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
         rgb = mix(vec3(luma), rgb, saturation);
 
-        // 3. 对比度: 绕中点 0.5
+        // 4. 对比度: 绕中点 0.5
         rgb = (rgb - 0.5) * contrast + 0.5;
 
-        // 4. 红色发光: 仅 "R 高 且 G/B 低" 的纯红像素 (♥♦), 非线性推向 1.0
+        // 5. 红色发光: 仅 "R 高 且 G/B 低" 的纯红像素 (♥♦), 非线性推向 1.0
         //    黑色 (R≈0) 和白色 (R≈G≈B) 不受影响
         float gbMax = max(rgb.g, rgb.b);
         float redMask = smoothstep(0.4, 0.7, rgb.r) * max(0.0, 1.0 - gbMax);
         rgb.r = rgb.r + redGlow * redMask * (1.0 - rgb.r);
 
-        // 5. 高光提亮: > 0.7 的通道非线性推向 1.0
+        // 6. 高光提亮: > 0.7 的通道非线性推向 1.0
         vec3 highlightMask = smoothstep(vec3(0.7), vec3(1.0), rgb);
         rgb = rgb + highlightLift * highlightMask * (1.0 - rgb);
 
@@ -257,7 +271,7 @@ final class VideoFilterPipeline: ObservableObject {
     var isPassThrough: Bool {
         if !enabled { return true }
         if cardEnhanceKernel == nil { return true }
-        return blackPoint == 0 && contrast == 1.0 && saturation == 1.0
+        return blackPoint == 0 && brightness == 0 && contrast == 1.0 && saturation == 1.0
             && redGlow == 0 && highlightLift == 0
     }
 
@@ -294,7 +308,7 @@ final class VideoFilterPipeline: ObservableObject {
         // 单 pass: 所有色彩运算在一次 GPU dispatch 内完成
         let outImage = kernel.apply(
             extent: ciImage.extent,
-            arguments: [ciImage, blackPoint, contrast, saturation, redGlow, highlightLift]
+            arguments: [ciImage, blackPoint, brightness, contrast, saturation, redGlow, highlightLift]
         )
         guard let result = outImage else { return nil }
 

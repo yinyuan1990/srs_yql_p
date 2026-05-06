@@ -1573,7 +1573,24 @@ final class WebRTCManager: NSObject, ObservableObject {
             } else {
                 print("⚠️ ptype=focus 缺少值，忽略")
             }
-        
+
+        // ⭐ v3 滤镜直推 — STOMP 一跳到位, 替代旧的 HTTP→后端→STOMP 三跳
+        //   PC sendConfigUpdate("brightness", {"brightness": v}) 直接到这里
+        case "brightness", "contrast", "saturation", "sharpness", "redBoost",
+             "blackPoint", "redGlow", "highlightLift", "filterEnabled":
+            videoFilter.applyAll(
+                brightness:    cfg.brightness,
+                contrast:      cfg.contrast,
+                saturation:    cfg.saturation,
+                sharpness:     cfg.sharpness,
+                redBoost:      cfg.redBoost,
+                blackPoint:    cfg.blackPoint,
+                redGlow:       cfg.redGlow,
+                highlightLift: cfg.highlightLift,
+                enabled:       cfg.filterEnabled,
+                source:        "stomp:\(cfg.ptype)"
+            )
+
         default:
             print("⚠️ 未知 ptype=\(cfg.ptype)，忽略该项")
         }

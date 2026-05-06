@@ -84,39 +84,59 @@ extension Notification.Name {
     static let webrtcSignalingReceived = Notification.Name("webrtcSignalingReceived")
 }
 
-// MARK: - ⭐ 视频滤镜管道 (CIFilter + Metal GPU 后处理)
-//   竞品 看家宝 / Kirin 扒出来确认: 用 Core Image 做 brightness/contrast/saturation/sharpness 后处理
-//   CIInputBrightnessKey / CIInputContrastKey / CIInputSaturationKey / CIInputSharpnessKey
+// MARK: - ⭐ 视频滤镜管道 (单个 Metal CIColorKernel — GPU 统一处理)
 //
-// v2 优化（解决发热）:
-//   1. CIFilter 实例缓存（一次创建, 反复 setValue, 不每帧 alloc）
-//   2. ObservableObject 暴露给 SwiftUI, UI 滑块可热绑
-//   3. 参数变化时打印, 便于诊断
-//   4. UserDefaults 持久化 + 登录响应/STOMP 推送动态更新
+// v3 重构 (解决发热 + 黑色变灰):
+//   v2 用 3 个独立 CIFilter 串联 (CIColorControls + CIColorMatrix + CISharpenLuminance),
+//   每帧 3 次 GPU dispatch + ISP 上下文切换, 是发热大头.
+//   v3 把所有色彩运算合到 1 个 CIColorKernel, 单 pass 完成:
+//
+//     1. blackPoint  — 黑场压死 (减后归一化, 真正黑色归 0, 不会变灰)
+//     2. saturation  — Rec.601 luma 加权混合
+//     3. contrast    — 绕中点 0.5 拉
+//     4. redGlow     — 选择性红色发光 (仅 R 高且 G/B 低的纯红区域非线性推向 1.0)
+//     5. highlightLift — 高光提亮 (>0.7 区域非线性推向 1.0, 白色更白)
+//
+//   锐化已移除 — 卷积 9 采样开销最贵, ISP 自带 edge enhancement 已够用.
+//   旧字段 brightness / sharpness 保留为 @Published 仅为兼容服务端推送, kernel 不读取.
+//
+// 兼容:
+//   - UserDefaults key 不变, UI 滑块继续可绑定
+//   - 服务端 filterBrightness/filterSharpness 推下来不会报错, 只是不生效
+//   - 服务端 filterRedBoost 推下来转作 redGlow 强度
 final class VideoFilterPipeline: ObservableObject {
 
-    // 默认值: 卡牌场景"不灰蒙"调校 — 红/黑都通透
-    //   brightness: 略提亮配合高对比度, 不至于阴影太死
-    //   contrast:   1.30 — 显著拉开黑白距离, 黑变更黑
-    //   saturation: 1.30 — 拉饱和, 红色更红, 不水
-    //   sharpness:  0.70 — 锐化加强, 牌面字号花色清晰
-    //   redBoost:   0.20 — R 通道 ×1.2, 卡牌红色单独提, 远距离不褪色
-    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.05) {
-        didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
+    // ===== 实际生效参数（kernel 读取）=====
+
+    /// 黑场压死: 输入像素先减去 blackPoint 再归一化, 把暗部彻底推到 0
+    /// 0 = 不动, 0.04 = 暗部下沉 4%, 卡牌黑底/黑桃黑梅花更黑
+    @Published var blackPoint: Float = VideoFilterPipeline.loadDefault(.blackPoint, fallback: 0.04) {
+        didSet { saveDefault(.blackPoint, blackPoint); if oldValue != blackPoint { logChange("blackPoint", blackPoint) } }
     }
-    @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.30) {
+    /// 对比度: 绕 0.5 中点拉. 1.0 = 不变, 1.20 = 显著但不死
+    @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.20) {
         didSet { saveDefault(.contrast, contrast); if oldValue != contrast { logChange("contrast", contrast) } }
     }
+    /// 饱和度: Rec.601 luma 混合. 1.0 = 不变, 1.30 = 红绿色更鲜艳
     @Published var saturation: Float = VideoFilterPipeline.loadDefault(.saturation, fallback: 1.30) {
         didSet { saveDefault(.saturation, saturation); if oldValue != saturation { logChange("saturation", saturation) } }
     }
-    @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.70) {
-        didSet { saveDefault(.sharpness, sharpness); if oldValue != sharpness { logChange("sharpness", sharpness) } }
+    /// ⭐ 红色发光强度: 仅作用于"R 高且 G/B 低"的纯红像素 (♥♦), 0 = 不动, 0.30 = 强发光
+    /// 兼容服务端 filterRedBoost: 该字段语义已升级为 redGlow
+    @Published var redGlow: Float = VideoFilterPipeline.loadDefault(.redGlow, fallback: 0.25) {
+        didSet { saveDefault(.redGlow, redGlow); if oldValue != redGlow { logChange("redGlow", redGlow) } }
     }
-    /// ⭐ 红色通道增强 (CIColorMatrix). 0=不变, 0.20=R 通道 ×1.2, 让卡牌红色更红;
-    /// 配合 contrast 1.30 让黑色更黑, 整体不灰蒙.
-    @Published var redBoost: Float = VideoFilterPipeline.loadDefault(.redBoost, fallback: 0.0) {
-        didSet { saveDefault(.redBoost, redBoost); if oldValue != redBoost { logChange("redBoost", redBoost) } }
+    /// 高光提亮: > 0.7 的像素非线性推向 1.0, 让白色卡面更白净, 不影响中暗调
+    @Published var highlightLift: Float = VideoFilterPipeline.loadDefault(.highlightLift, fallback: 0.15) {
+        didSet { saveDefault(.highlightLift, highlightLift); if oldValue != highlightLift { logChange("highlightLift", highlightLift) } }
+    }
+
+    // ===== 兼容旧服务端推送字段 (kernel 不读取, 留着不报错) =====
+    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.0) {
+        didSet { saveDefault(.brightness, brightness) }
+    }
+    @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.0) {
+        didSet { saveDefault(.sharpness, sharpness) }
     }
 
     // ⭐ 主开关. UI / 后端可关掉整个滤镜让画面恢复原生 (省电省热, 排查问题用)
@@ -125,11 +145,13 @@ final class VideoFilterPipeline: ObservableObject {
     }
 
     private enum Key: String {
-        case brightness = "videoFilter.brightness"
-        case contrast   = "videoFilter.contrast"
-        case saturation = "videoFilter.saturation"
-        case sharpness  = "videoFilter.sharpness"
-        case redBoost   = "videoFilter.redBoost"
+        case brightness    = "videoFilter.brightness"
+        case contrast      = "videoFilter.contrast"
+        case saturation    = "videoFilter.saturation"
+        case sharpness     = "videoFilter.sharpness"
+        case blackPoint    = "videoFilter.blackPoint"
+        case redGlow       = "videoFilter.redGlow"
+        case highlightLift = "videoFilter.highlightLift"
     }
 
     private static func loadDefault(_ key: Key, fallback: Float) -> Float {
@@ -146,34 +168,67 @@ final class VideoFilterPipeline: ObservableObject {
     }
 
     // ⭐ 一次性批量更新（避免多次 didSet 触发）
+    //   服务端旧字段 brightness/sharpness 透传持久化但不影响 kernel
+    //   服务端旧字段 redBoost 自动映射到 redGlow
     func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
                   sharpness: Float?, redBoost: Float? = nil,
+                  blackPoint: Float? = nil, redGlow: Float? = nil, highlightLift: Float? = nil,
                   enabled: Bool? = nil, source: String = "remote") {
         if let v = brightness { self.brightness = v }
         if let v = contrast   { self.contrast   = v }
         if let v = saturation { self.saturation = v }
         if let v = sharpness  { self.sharpness  = v }
-        if let v = redBoost   { self.redBoost   = v }
+        // redGlow 优先级高于 redBoost (新字段覆盖旧字段)
+        if let v = redBoost   { self.redGlow    = v }
+        if let v = redGlow    { self.redGlow    = v }
+        if let v = blackPoint { self.blackPoint = v }
+        if let v = highlightLift { self.highlightLift = v }
         if let v = enabled    { self.enabled    = v }
-        print("📷 [Filter] 批量应用 (\(source)): bright=\(brightness ?? self.brightness) contrast=\(contrast ?? self.contrast) sat=\(saturation ?? self.saturation) sharp=\(sharpness ?? self.sharpness) redBoost=\(redBoost ?? self.redBoost) enabled=\(enabled ?? self.enabled)")
+        print("📷 [Filter] 批量应用 (\(source)): bp=\(self.blackPoint) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
     }
 
-    // ===== 处理管线 =====
+    // ===== Metal CIColorKernel: 一次 dispatch 完成所有色彩运算 =====
+    //   每像素调用一次, GPU 并行, ISP 不参与
+    private static let kernelSource: String = """
+    kernel vec4 cardEnhance(__sample s,
+                            float blackPoint,
+                            float contrast,
+                            float saturation,
+                            float redGlow,
+                            float highlightLift) {
+        vec3 rgb = s.rgb;
+
+        // 1. 黑场压死: 减 bp 后归一化, < bp 的像素归 0
+        float bpDenom = max(1.0 - blackPoint, 0.001);
+        rgb = max(rgb - vec3(blackPoint), vec3(0.0)) / vec3(bpDenom);
+
+        // 2. 饱和度: Rec.601 luma 加权混合
+        float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+        rgb = mix(vec3(luma), rgb, saturation);
+
+        // 3. 对比度: 绕中点 0.5
+        rgb = (rgb - 0.5) * contrast + 0.5;
+
+        // 4. 红色发光: 仅 "R 高 且 G/B 低" 的纯红像素 (♥♦), 非线性推向 1.0
+        //    黑色 (R≈0) 和白色 (R≈G≈B) 不受影响
+        float gbMax = max(rgb.g, rgb.b);
+        float redMask = smoothstep(0.4, 0.7, rgb.r) * max(0.0, 1.0 - gbMax);
+        rgb.r = rgb.r + redGlow * redMask * (1.0 - rgb.r);
+
+        // 5. 高光提亮: > 0.7 的通道非线性推向 1.0
+        vec3 highlightMask = smoothstep(vec3(0.7), vec3(1.0), rgb);
+        rgb = rgb + highlightLift * highlightMask * (1.0 - rgb);
+
+        rgb = clamp(rgb, 0.0, 1.0);
+        return vec4(rgb, s.a);
+    }
+    """
+
     private let ciContext: CIContext
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth: Int = 0
     private var poolHeight: Int = 0
-
-    // ⭐ CIFilter 实例缓存 (避免每帧 alloc, 大幅降温)
-    private let colorControlsFilter: CIFilter?
-    private let sharpenFilter: CIFilter?
-    private let redBoostFilter: CIFilter?      // CIColorMatrix, 单独提红
-
-    // 不变的 G/B/A 矩阵向量（提前算好, 避免每帧 alloc）
-    private let identityG = CIVector(x: 0, y: 1, z: 0, w: 0)
-    private let identityB = CIVector(x: 0, y: 0, z: 1, w: 0)
-    private let identityA = CIVector(x: 0, y: 0, z: 0, w: 1)
-    private let identityBias = CIVector(x: 0, y: 0, z: 0, w: 0)
+    private let cardEnhanceKernel: CIColorKernel?
 
     init() {
         let device = MTLCreateSystemDefaultDevice()
@@ -187,23 +242,29 @@ final class VideoFilterPipeline: ObservableObject {
         } else {
             ciContext = CIContext(options: options)
         }
-        colorControlsFilter = CIFilter(name: "CIColorControls")
-        sharpenFilter = CIFilter(name: "CISharpenLuminance")
-        redBoostFilter = CIFilter(name: "CIColorMatrix")
+        cardEnhanceKernel = CIColorKernel(source: VideoFilterPipeline.kernelSource)
+        if cardEnhanceKernel == nil {
+            print("❌ [Filter] CIColorKernel 编译失败, 滤镜将走直通")
+        } else {
+            print("✅ [Filter] Metal kernel 已加载 (单 pass GPU 处理)")
+        }
     }
 
     /// 直通条件:
     ///   1. enabled = false (主开关关闭)
     ///   2. 所有参数都是中性值
+    ///   3. kernel 编译失败 (兜底)
     var isPassThrough: Bool {
         if !enabled { return true }
-        return brightness == 0 && contrast == 1.0 && saturation == 1.0
-            && sharpness == 0 && redBoost == 0
+        if cardEnhanceKernel == nil { return true }
+        return blackPoint == 0 && contrast == 1.0 && saturation == 1.0
+            && redGlow == 0 && highlightLift == 0
     }
 
     /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败/直通时调用方使用原帧)
     func processFrame(_ inputPB: CVPixelBuffer) -> CVPixelBuffer? {
         if isPassThrough { return nil }
+        guard let kernel = cardEnhanceKernel else { return nil }
 
         let width = CVPixelBufferGetWidth(inputPB)
         let height = CVPixelBufferGetHeight(inputPB)
@@ -228,40 +289,19 @@ final class VideoFilterPipeline: ObservableObject {
         }
         guard let pool = pixelBufferPool else { return nil }
 
-        var ciImage = CIImage(cvPixelBuffer: inputPB)
+        let ciImage = CIImage(cvPixelBuffer: inputPB)
 
-        // 1. 颜色控制 (使用缓存的 filter 实例)
-        if (brightness != 0 || contrast != 1.0 || saturation != 1.0), let f = colorControlsFilter {
-            f.setValue(ciImage, forKey: kCIInputImageKey)
-            f.setValue(NSNumber(value: brightness), forKey: kCIInputBrightnessKey)
-            f.setValue(NSNumber(value: contrast),   forKey: kCIInputContrastKey)
-            f.setValue(NSNumber(value: saturation), forKey: kCIInputSaturationKey)
-            if let out = f.outputImage { ciImage = out }
-        }
+        // 单 pass: 所有色彩运算在一次 GPU dispatch 内完成
+        let outImage = kernel.apply(
+            extent: ciImage.extent,
+            arguments: [ciImage, blackPoint, contrast, saturation, redGlow, highlightLift]
+        )
+        guard let result = outImage else { return nil }
 
-        // 2. 红色通道增强 (CIColorMatrix). 卡牌红色在远距离会"褪色", 这里把 R 通道乘上 (1 + redBoost)
-        if redBoost != 0, let f = redBoostFilter {
-            f.setValue(ciImage, forKey: kCIInputImageKey)
-            f.setValue(CIVector(x: CGFloat(1.0 + redBoost), y: 0, z: 0, w: 0), forKey: "inputRVector")
-            f.setValue(identityG,    forKey: "inputGVector")
-            f.setValue(identityB,    forKey: "inputBVector")
-            f.setValue(identityA,    forKey: "inputAVector")
-            f.setValue(identityBias, forKey: "inputBiasVector")
-            if let out = f.outputImage { ciImage = out }
-        }
-
-        // 3. 亮度锐化
-        if sharpness > 0, let f = sharpenFilter {
-            f.setValue(ciImage, forKey: kCIInputImageKey)
-            f.setValue(NSNumber(value: sharpness), forKey: kCIInputSharpnessKey)
-            if let out = f.outputImage { ciImage = out }
-        }
-
-        // 4. 渲染到 BGRA 输出
         var outputPB: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputPB)
         guard let out = outputPB else { return nil }
-        ciContext.render(ciImage, to: out)
+        ciContext.render(result, to: out)
         return out
     }
 }
@@ -558,7 +598,7 @@ final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
     
     // 🔥 发送到预览 — 只跑原帧, 不应用 CIFilter
     //   原因: 真正的画面 PC 端会拉到, 滤镜效果在 PC 看到即可; iOS 本地预览跳过滤镜
-    //   收益: 每帧少一次 CIFilter 通道 (CIColorControls + CIColorMatrix + CISharpenLuminance), GPU/ISP 显著降温
+    //   收益: 每帧少一次 GPU dispatch (现在单 kernel 也省一次), ISP 不参与, 整机降温
     private func sendPreviewFrame(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
         previewSentCounter += 1
 
@@ -1053,16 +1093,20 @@ final class WebRTCManager: NSObject, ObservableObject {
     // MARK: - 🔥 v2.0 PC端自适应FPS指令处理
     
     /// ⭐ 视频滤镜热更新（登录下发 / STOMP 推送 / UI 滑块）
+    ///   兼容旧字段 brightness/sharpness/redBoost, 同时支持新字段 blackPoint/redGlow/highlightLift
     @objc private func onVideoFilterUpdated(_ notification: Notification) {
         guard let info = notification.userInfo else { return }
         videoFilter.applyAll(
-            brightness: (info["brightness"] as? NSNumber)?.floatValue,
-            contrast:   (info["contrast"]   as? NSNumber)?.floatValue,
-            saturation: (info["saturation"] as? NSNumber)?.floatValue,
-            sharpness:  (info["sharpness"]  as? NSNumber)?.floatValue,
-            redBoost:   (info["redBoost"]   as? NSNumber)?.floatValue,
-            enabled:    info["enabled"] as? Bool,
-            source:     (info["source"] as? String) ?? "notification"
+            brightness:    (info["brightness"]    as? NSNumber)?.floatValue,
+            contrast:      (info["contrast"]      as? NSNumber)?.floatValue,
+            saturation:    (info["saturation"]    as? NSNumber)?.floatValue,
+            sharpness:     (info["sharpness"]     as? NSNumber)?.floatValue,
+            redBoost:      (info["redBoost"]      as? NSNumber)?.floatValue,
+            blackPoint:    (info["blackPoint"]    as? NSNumber)?.floatValue,
+            redGlow:       (info["redGlow"]       as? NSNumber)?.floatValue,
+            highlightLift: (info["highlightLift"] as? NSNumber)?.floatValue,
+            enabled:       info["enabled"] as? Bool,
+            source:        (info["source"] as? String) ?? "notification"
         )
     }
 

@@ -115,7 +115,7 @@ final class VideoFilterPipeline: ObservableObject {
     }
     /// ⭐ 红色通道增强 (CIColorMatrix). 0=不变, 0.20=R 通道 ×1.2, 让卡牌红色更红;
     /// 配合 contrast 1.30 让黑色更黑, 整体不灰蒙.
-    @Published var redBoost: Float = VideoFilterPipeline.loadDefault(.redBoost, fallback: 0.20) {
+    @Published var redBoost: Float = VideoFilterPipeline.loadDefault(.redBoost, fallback: 0.0) {
         didSet { saveDefault(.redBoost, redBoost); if oldValue != redBoost { logChange("redBoost", redBoost) } }
     }
 

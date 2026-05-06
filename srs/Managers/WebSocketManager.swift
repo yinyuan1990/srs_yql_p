@@ -585,6 +585,7 @@ extension WebSocketManager: SwiftStompDelegate {
                 if let v = msgDict?["contrast"]   as? NSNumber { info["contrast"]   = v }
                 if let v = msgDict?["saturation"] as? NSNumber { info["saturation"] = v }
                 if let v = msgDict?["sharpness"]  as? NSNumber { info["sharpness"]  = v }
+                if let v = msgDict?["redBoost"]   as? NSNumber { info["redBoost"]   = v }
                 if let v = msgDict?["enabled"]    as? Bool     { info["enabled"]    = v }
                 print("🎨 [set_filter] PC 推送滤镜参数: \(info)")
                 DispatchQueue.main.async {

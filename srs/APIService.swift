@@ -133,6 +133,7 @@ struct LoginResponse: Codable {
     let filterContrast: Float?
     let filterSaturation: Float?
     let filterSharpness: Float?
+    let filterRedBoost: Float?    // ⭐ 红色通道增强 (CIColorMatrix R 通道倍数 - 1)
 }
 
 

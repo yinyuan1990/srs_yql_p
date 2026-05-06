@@ -95,18 +95,28 @@ extension Notification.Name {
 //   4. UserDefaults 持久化 + 登录响应/STOMP 推送动态更新
 final class VideoFilterPipeline: ObservableObject {
 
-    // 默认值参考竞品观感, 通过 UserDefaults 持久化, 后端可推送覆盖
-    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.10) {
+    // 默认值: 卡牌场景"不灰蒙"调校 — 红/黑都通透
+    //   brightness: 略提亮配合高对比度, 不至于阴影太死
+    //   contrast:   1.30 — 显著拉开黑白距离, 黑变更黑
+    //   saturation: 1.30 — 拉饱和, 红色更红, 不水
+    //   sharpness:  0.70 — 锐化加强, 牌面字号花色清晰
+    //   redBoost:   0.20 — R 通道 ×1.2, 卡牌红色单独提, 远距离不褪色
+    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.05) {
         didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
     }
-    @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.15) {
+    @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.30) {
         didSet { saveDefault(.contrast, contrast); if oldValue != contrast { logChange("contrast", contrast) } }
     }
-    @Published var saturation: Float = VideoFilterPipeline.loadDefault(.saturation, fallback: 1.10) {
+    @Published var saturation: Float = VideoFilterPipeline.loadDefault(.saturation, fallback: 1.30) {
         didSet { saveDefault(.saturation, saturation); if oldValue != saturation { logChange("saturation", saturation) } }
     }
-    @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.5) {
+    @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.70) {
         didSet { saveDefault(.sharpness, sharpness); if oldValue != sharpness { logChange("sharpness", sharpness) } }
+    }
+    /// ⭐ 红色通道增强 (CIColorMatrix). 0=不变, 0.20=R 通道 ×1.2, 让卡牌红色更红;
+    /// 配合 contrast 1.30 让黑色更黑, 整体不灰蒙.
+    @Published var redBoost: Float = VideoFilterPipeline.loadDefault(.redBoost, fallback: 0.20) {
+        didSet { saveDefault(.redBoost, redBoost); if oldValue != redBoost { logChange("redBoost", redBoost) } }
     }
 
     // ⭐ 主开关. UI / 后端可关掉整个滤镜让画面恢复原生 (省电省热, 排查问题用)
@@ -119,6 +129,7 @@ final class VideoFilterPipeline: ObservableObject {
         case contrast   = "videoFilter.contrast"
         case saturation = "videoFilter.saturation"
         case sharpness  = "videoFilter.sharpness"
+        case redBoost   = "videoFilter.redBoost"
     }
 
     private static func loadDefault(_ key: Key, fallback: Float) -> Float {
@@ -134,15 +145,17 @@ final class VideoFilterPipeline: ObservableObject {
         print("📷 [Filter] \(name) = \(String(format: "%.3f", v))")
     }
 
-    // ⭐ 一次性批量更新（避免 4 次 didSet 触发）
+    // ⭐ 一次性批量更新（避免多次 didSet 触发）
     func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
-                  sharpness: Float?, enabled: Bool? = nil, source: String = "remote") {
+                  sharpness: Float?, redBoost: Float? = nil,
+                  enabled: Bool? = nil, source: String = "remote") {
         if let v = brightness { self.brightness = v }
         if let v = contrast   { self.contrast   = v }
         if let v = saturation { self.saturation = v }
         if let v = sharpness  { self.sharpness  = v }
+        if let v = redBoost   { self.redBoost   = v }
         if let v = enabled    { self.enabled    = v }
-        print("📷 [Filter] 批量应用 (\(source)): bright=\(brightness ?? self.brightness) contrast=\(contrast ?? self.contrast) sat=\(saturation ?? self.saturation) sharp=\(sharpness ?? self.sharpness) enabled=\(enabled ?? self.enabled)")
+        print("📷 [Filter] 批量应用 (\(source)): bright=\(brightness ?? self.brightness) contrast=\(contrast ?? self.contrast) sat=\(saturation ?? self.saturation) sharp=\(sharpness ?? self.sharpness) redBoost=\(redBoost ?? self.redBoost) enabled=\(enabled ?? self.enabled)")
     }
 
     // ===== 处理管线 =====
@@ -154,6 +167,13 @@ final class VideoFilterPipeline: ObservableObject {
     // ⭐ CIFilter 实例缓存 (避免每帧 alloc, 大幅降温)
     private let colorControlsFilter: CIFilter?
     private let sharpenFilter: CIFilter?
+    private let redBoostFilter: CIFilter?      // CIColorMatrix, 单独提红
+
+    // 不变的 G/B/A 矩阵向量（提前算好, 避免每帧 alloc）
+    private let identityG = CIVector(x: 0, y: 1, z: 0, w: 0)
+    private let identityB = CIVector(x: 0, y: 0, z: 1, w: 0)
+    private let identityA = CIVector(x: 0, y: 0, z: 0, w: 1)
+    private let identityBias = CIVector(x: 0, y: 0, z: 0, w: 0)
 
     init() {
         let device = MTLCreateSystemDefaultDevice()
@@ -169,6 +189,7 @@ final class VideoFilterPipeline: ObservableObject {
         }
         colorControlsFilter = CIFilter(name: "CIColorControls")
         sharpenFilter = CIFilter(name: "CISharpenLuminance")
+        redBoostFilter = CIFilter(name: "CIColorMatrix")
     }
 
     /// 直通条件:
@@ -176,7 +197,8 @@ final class VideoFilterPipeline: ObservableObject {
     ///   2. 所有参数都是中性值
     var isPassThrough: Bool {
         if !enabled { return true }
-        return brightness == 0 && contrast == 1.0 && saturation == 1.0 && sharpness == 0
+        return brightness == 0 && contrast == 1.0 && saturation == 1.0
+            && sharpness == 0 && redBoost == 0
     }
 
     /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败/直通时调用方使用原帧)
@@ -217,14 +239,25 @@ final class VideoFilterPipeline: ObservableObject {
             if let out = f.outputImage { ciImage = out }
         }
 
-        // 2. 亮度锐化
+        // 2. 红色通道增强 (CIColorMatrix). 卡牌红色在远距离会"褪色", 这里把 R 通道乘上 (1 + redBoost)
+        if redBoost != 0, let f = redBoostFilter {
+            f.setValue(ciImage, forKey: kCIInputImageKey)
+            f.setValue(CIVector(x: CGFloat(1.0 + redBoost), y: 0, z: 0, w: 0), forKey: "inputRVector")
+            f.setValue(identityG,    forKey: "inputGVector")
+            f.setValue(identityB,    forKey: "inputBVector")
+            f.setValue(identityA,    forKey: "inputAVector")
+            f.setValue(identityBias, forKey: "inputBiasVector")
+            if let out = f.outputImage { ciImage = out }
+        }
+
+        // 3. 亮度锐化
         if sharpness > 0, let f = sharpenFilter {
             f.setValue(ciImage, forKey: kCIInputImageKey)
             f.setValue(NSNumber(value: sharpness), forKey: kCIInputSharpnessKey)
             if let out = f.outputImage { ciImage = out }
         }
 
-        // 3. 渲染到 BGRA 输出
+        // 4. 渲染到 BGRA 输出
         var outputPB: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputPB)
         guard let out = outputPB else { return nil }
@@ -298,8 +331,9 @@ final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
     private var rtp90kStep: Int64 = 1500            // 每帧步进（90000/fps）
     private var isFirstFrame: Bool = true           // 是否第一帧
     
-    // 🔥 预览固定60fps
-    private let previewFps: Int = 60
+    // 🔥 预览 15fps (从 60 降下来 - 业主只是看个画面证明在采集, 真正画面 PC 端拉)
+    //   降本: MTKView 渲染 -75%, 整机发热显著下降
+    private let previewFps: Int = 15
     private var previewSentCounter: Int = 0
     
     // 🔥 采集帧率检测（用于自动调整跳帧比例）
@@ -522,14 +556,14 @@ final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
         }
     }
     
-    // 🔥 发送到预览
+    // 🔥 发送到预览 — 只跑原帧, 不应用 CIFilter
+    //   原因: 真正的画面 PC 端会拉到, 滤镜效果在 PC 看到即可; iOS 本地预览跳过滤镜
+    //   收益: 每帧少一次 CIFilter 通道 (CIColorControls + CIColorMatrix + CISharpenLuminance), GPU/ISP 显著降温
     private func sendPreviewFrame(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
         previewSentCounter += 1
 
-        // ⭐ 滤镜后处理 (亮度/对比度/饱和度/锐度); 直通模式开销近 0
-        let filtered = applyFilter(videoFrame)
         let fixedFrame = RTCVideoFrame(
-            buffer: filtered.buffer,
+            buffer: videoFrame.buffer,
             rotation: ._0,
             timeStampNs: videoFrame.timeStampNs
         )
@@ -1026,6 +1060,7 @@ final class WebRTCManager: NSObject, ObservableObject {
             contrast:   (info["contrast"]   as? NSNumber)?.floatValue,
             saturation: (info["saturation"] as? NSNumber)?.floatValue,
             sharpness:  (info["sharpness"]  as? NSNumber)?.floatValue,
+            redBoost:   (info["redBoost"]   as? NSNumber)?.floatValue,
             enabled:    info["enabled"] as? Bool,
             source:     (info["source"] as? String) ?? "notification"
         )

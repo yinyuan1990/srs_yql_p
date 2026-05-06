@@ -542,6 +542,8 @@ struct MonitorLoginView: View {
                         UserDefaults.standard.set(v, forKey: "videoFilter.saturation") }
                     if let v = loginResponse.filterSharpness  { filterPayload["sharpness"]  = v;
                         UserDefaults.standard.set(v, forKey: "videoFilter.sharpness") }
+                    if let v = loginResponse.filterRedBoost   { filterPayload["redBoost"]   = v;
+                        UserDefaults.standard.set(v, forKey: "videoFilter.redBoost") }
                     if !filterPayload.isEmpty {
                         print("🔄 [Login] 视频滤镜下发: \(filterPayload)")
                         NotificationCenter.default.post(

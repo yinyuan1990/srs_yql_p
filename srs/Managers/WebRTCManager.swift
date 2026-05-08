@@ -838,13 +838,14 @@ final class WebRTCManager: NSObject, ObservableObject {
     /// 任一端是 cellular 就走 relay (CGNAT/Symmetric NAT 直连必败)
     private var peerNetworkType: [String: String] = [:]
     /// 综合判断本次连接是否应该 forceRelay。考虑 4 个信号:
-    ///   1. 后台下发的 forceRelay 总开关
+    ///   ⭐ 1. 后台下发的 forceRelay 总开关 — 最高优先级, 命中即直接返回
     ///   2. 本机走蜂窝网 (CGNAT, 必败)
     ///   3. 对端 PC 上报走蜂窝 (CGNAT, 必败)
     ///   4. 该 pc 之前 ICE 失败被加入黑名单
     private func effectiveForceRelay(for pcDeviceId: String) -> Bool {
-        return forceRelay
-            || isOnCellular
+        // ⭐ 后端配置 p2p.force.relay = true 时, 优先级最高, 跳过网络协商
+        if forceRelay { return true }
+        return isOnCellular
             || (peerNetworkType[pcDeviceId] == "cellular")
             || forceRelayPeerIds.contains(pcDeviceId)
     }

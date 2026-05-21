@@ -771,12 +771,43 @@ final class WebRTCManager: NSObject, ObservableObject {
 
     /// 当前是否处于 240fps 高速模式
     @Published var isHighSpeedMode: Bool = false
+    /// 进入240fps前的摄像头方向（用于退出时恢复）
+    private var preHighSpeedCameraPosition: AVCaptureDevice.Position?
 
-    /// 切换到 240fps 高速模式（640x640 低分辨率 + 高帧率）
+    /// 切换到 240fps 高速模式（后置摄像头 + 高帧率）
     @MainActor
     func switchTo240fps() {
         guard let device = getCurrentCaptureDevice() else {
             print("❌ [240fps] 无法获取摄像头设备")
+            return
+        }
+
+        // 1. 检查摄像头方向：240fps 只有后置支持
+        if let input = capturer?.captureSession.inputs.first as? AVCaptureDeviceInput {
+            let currentPos = input.device.position
+            if currentPos == .front {
+                // 记住当前方向，切到后置
+                preHighSpeedCameraPosition = .front
+                print("⚡ [240fps] 当前前置摄像头，自动切换到后置")
+                toggleCamera()
+                // 切换后需要重新获取设备
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    self?.switchTo240fpsInternal()
+                }
+                return
+            } else {
+                preHighSpeedCameraPosition = .back
+            }
+        }
+
+        switchTo240fpsInternal()
+    }
+
+    /// 内部实际执行 240fps 切换（确保已在后置摄像头）
+    @MainActor
+    private func switchTo240fpsInternal() {
+        guard let device = getCurrentCaptureDevice() else {
+            print("❌ [240fps] 切换后无法获取摄像头设备")
             return
         }
 
@@ -860,6 +891,16 @@ final class WebRTCManager: NSObject, ObservableObject {
 
         isHighSpeedMode = false
         print("✅ [普通模式] 已恢复 (1080p@30fps)")
+
+        // 恢复之前的摄像头方向（如果进入240fps时从前置切到了后置）
+        if preHighSpeedCameraPosition == .front {
+            if let input = capturer?.captureSession.inputs.first as? AVCaptureDeviceInput,
+               input.device.position == .back {
+                print("⚡ [普通模式] 恢复前置摄像头")
+                toggleCamera()
+            }
+        }
+        preHighSpeedCameraPosition = nil
     }
 
     /// 温度监控：过热自动降级

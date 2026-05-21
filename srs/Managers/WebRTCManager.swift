@@ -1020,6 +1020,20 @@ final class WebRTCManager: NSObject, ObservableObject {
                 enableAverageThrottling(true)
             }
 
+        case "highspeed":
+            // P2: 240fps 高速模式切换（PC端触发）
+            if let f = cfg.fps, f >= 240 {
+                print("⚡ [CONFIG_UPDATE] 收到超快帧开启指令 fps=\(f)")
+                Task { @MainActor in
+                    self.switchTo240fps()
+                }
+            } else {
+                print("⚡ [CONFIG_UPDATE] 收到超快帧关闭指令，恢复普通模式")
+                Task { @MainActor in
+                    self.switchToNormal()
+                }
+            }
+
         case "direction":
             // 方向："-1"后置；"1"前置（若不一致则切换一次）
             //print("🔍 收到 direction 切换请求: cfg.direction=\(cfg.direction)")

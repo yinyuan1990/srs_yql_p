@@ -741,7 +741,10 @@ final class WebRTCManager: NSObject, ObservableObject {
                 device.setExposureModeCustom(duration: safeDuration, iso: fixedISO, completionHandler: nil)
                 print("📸 [快门优先] 快门=1/\(actualShutterSpeed)s(snap:\(cjfpsValue)→\(snappedShutter)), ISO=\(Int(fixedISO))[\(autoIsoEnabled ? "闭环" : "中位")]")
 
-                let targetFps = max(currentCaptureFPS, 15)
+                // 采集帧率锁定为推流帧率（不跟随快门速度）
+                // 快门1/240s不需要240fps采集——曝光时长<帧间隔即可
+                let pushFps = frameThrottler?.targetSendFps ?? 30
+                let targetFps = max(pushFps, 15)
                 let frameDuration = CMTime(value: 1, timescale: CMTimeScale(targetFps))
                 device.activeVideoMinFrameDuration = frameDuration
                 device.activeVideoMaxFrameDuration = frameDuration

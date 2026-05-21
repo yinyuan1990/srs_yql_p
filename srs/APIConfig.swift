@@ -8,31 +8,30 @@ class APIConfig {
     private init() {}
     
     // MARK: - 服务器配置
-    
+
     // 基础URL - 可以根据环境切换
-    // IP地址变更: 8.162.10.80 -> 47.242.52.139
     public var baseURL: String {
         #if DEBUG
-        return "http://47.242.52.139:9999" // 开发环境
+        return "https://api.147258yql.cn" // 开发环境
         #else
-        return "http://47.242.52.139:9999" // 生产环境
+        return "https://api.147258yql.cn" // 生产环境
         #endif
     }
 
 
     private var baseWsURL: String {
         #if DEBUG
-        return "ws://47.242.52.139:9999/native-ws"
+        return "wss://ws.147258yql.cn/native-ws"
         #else
-        return "ws://47.242.52.139:9999/native-ws"
+        return "wss://ws.147258yql.cn/native-ws"
         #endif
     }
 
     public var baseStompWsURL: String {
         #if DEBUG
-        return "ws://47.242.52.139:9999/ws"
+        return "wss://ws.147258yql.cn/ws"
         #else
-        return "ws://47.242.52.139:9999/ws"
+        return "wss://ws.147258yql.cn/ws"
         #endif
     }
     

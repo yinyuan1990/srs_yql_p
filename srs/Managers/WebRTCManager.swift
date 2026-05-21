@@ -84,636 +84,6 @@ extension Notification.Name {
     static let webrtcSignalingReceived = Notification.Name("webrtcSignalingReceived")
 }
 
-// MARK: - ⭐ 视频滤镜管道 (单个 Metal CIColorKernel — GPU 统一处理)
-//
-// v3 重构 (解决发热 + 黑色变灰):
-//   v2 用 3 个独立 CIFilter 串联 (CIColorControls + CIColorMatrix + CISharpenLuminance),
-//   每帧 3 次 GPU dispatch + ISP 上下文切换, 是发热大头.
-//   v3 把所有色彩运算合到 1 个 CIColorKernel, 单 pass 完成:
-//
-//     1. blackPoint  — 黑场压死 (减后归一化, 真正黑色归 0, 不会变灰)
-//     2. brightness  — 中调亮度曲线 (保端点不会让黑变灰, 只弯中调)
-//     3. saturation  — Rec.601 luma 加权混合
-//     4. contrast    — 绕中点 0.5 拉
-//     5. redGlow     — 选择性红色发光 (仅 R 高且 G/B 低的纯红区域非线性推向 1.0)
-//     6. highlightLift — 高光提亮 (>0.7 区域非线性推向 1.0, 白色更白)
-//
-//   锐化已移除 — 卷积 9 采样开销最贵, ISP 自带 edge enhancement 已够用.
-//   旧字段 sharpness 保留为 @Published 仅为兼容服务端推送, kernel 不读取.
-//
-//   v3.1: brightness 重新启用, 但用保端点曲线 (rgb + b·rgb·(1-rgb)) 替代 v2 的加法偏移,
-//         拖滑块会有效果但不会把黑色拉灰.
-//
-// 兼容:
-//   - UserDefaults key 不变, UI 滑块继续可绑定
-//   - 服务端 filterSharpness 推下来不会报错, 只是不生效
-//   - 服务端 filterBrightness 直接生效 (新算法)
-//   - 服务端 filterRedBoost 推下来转作 redGlow 强度
-final class VideoFilterPipeline: ObservableObject {
-
-    // ===== 实际生效参数（kernel 读取）=====
-
-    /// 黑场压死: 输入像素先减去 blackPoint 再归一化, 把暗部彻底推到 0
-    /// 0 = 不动, 0.10 = 暗部下沉 10% (压死 H.264 limited-range 的 16/255≈6% 伪黑)
-    /// 默认 0.10 是为了对抗 limited-range YUV 编码的"黑色 = 0.063 灰" 现象,
-    /// 让 ♠♣ 黑牌真正黑下去, 不再灰蒙蒙. 对中调影响极小 (<0.5% 失真).
-    @Published var blackPoint: Float = VideoFilterPipeline.loadDefault(.blackPoint, fallback: 0.10) {
-        didSet { saveDefault(.blackPoint, blackPoint); if oldValue != blackPoint { logChange("blackPoint", blackPoint) } }
-    }
-    /// 中调亮度: 保端点曲线 rgb + b·rgb·(1-rgb), -1..+1
-    /// 0 = 不变, 0.05 = 中调微提, 0.30 = 中调显著提亮
-    /// 黑场 (rgb=0) 和高光 (rgb=1) 都不受影响, 拖动不会把黑变灰
-    @Published var brightness: Float = VideoFilterPipeline.loadDefault(.brightness, fallback: 0.05) {
-        didSet { saveDefault(.brightness, brightness); if oldValue != brightness { logChange("brightness", brightness) } }
-    }
-    /// 曝光: rgb × 2^EV, -3..+3 stops, 乘法增益
-    /// 0 = 不变, +1 = 双倍 (1 stop), +2 = 4倍, -1 = 半倍
-    /// 把传感器噪声底"伪黑" (0.02~0.05) 乘出来变成可见暗部, 但高光会顶白
-    /// 配合 highlightLift 用: 暗部从噪声中拉起来, 同时保高光不死白
-    @Published var exposure: Float = VideoFilterPipeline.loadDefault(.exposure, fallback: 0.0) {
-        didSet { saveDefault(.exposure, exposure); if oldValue != exposure { logChange("exposure", exposure) } }
-    }
-    /// 伽马: pow 曲线 rgb' = rgb^(1/gamma), 0.5..2.0, 保端点
-    /// 1.0 = 不变, > 1 抬暗部 (♠♣ 花纹更清晰), < 1 压暗部 (黑更死)
-    /// 与 brightness 形状不同 (parabolic vs power), 对暗部更敏感
-    @Published var gamma: Float = VideoFilterPipeline.loadDefault(.gamma, fallback: 1.0) {
-        didSet { saveDefault(.gamma, gamma); if oldValue != gamma { logChange("gamma", gamma) } }
-    }
-    /// 对比度: 绕 0.5 中点拉. 1.0 = 不变, 1.20 = 显著但不死
-    @Published var contrast: Float = VideoFilterPipeline.loadDefault(.contrast, fallback: 1.20) {
-        didSet { saveDefault(.contrast, contrast); if oldValue != contrast { logChange("contrast", contrast) } }
-    }
-    /// 饱和度: Rec.601 luma 混合. 1.0 = 不变, 1.30 = 红绿色更鲜艳
-    @Published var saturation: Float = VideoFilterPipeline.loadDefault(.saturation, fallback: 1.30) {
-        didSet { saveDefault(.saturation, saturation); if oldValue != saturation { logChange("saturation", saturation) } }
-    }
-    /// ⭐ 红色发光强度: 仅作用于"R 高且 G/B 低"的纯红像素 (♥♦), 0 = 不动, 0.30 = 强发光
-    /// 兼容服务端 filterRedBoost: 该字段语义已升级为 redGlow
-    @Published var redGlow: Float = VideoFilterPipeline.loadDefault(.redGlow, fallback: 0.25) {
-        didSet { saveDefault(.redGlow, redGlow); if oldValue != redGlow { logChange("redGlow", redGlow) } }
-    }
-    /// 高光提亮: > 0.7 的像素非线性推向 1.0, 让白色卡面更白净, 不影响中暗调
-    @Published var highlightLift: Float = VideoFilterPipeline.loadDefault(.highlightLift, fallback: 0.15) {
-        didSet { saveDefault(.highlightLift, highlightLift); if oldValue != highlightLift { logChange("highlightLift", highlightLift) } }
-    }
-
-    // ===== 兼容旧服务端推送字段 (kernel 不读取, 留着不报错) =====
-    @Published var sharpness: Float = VideoFilterPipeline.loadDefault(.sharpness, fallback: 0.0) {
-        didSet { saveDefault(.sharpness, sharpness) }
-    }
-
-    // ⭐ 主开关. UI / 后端可关掉整个滤镜让画面恢复原生 (省电省热, 排查问题用)
-    @Published var enabled: Bool = UserDefaults.standard.object(forKey: "videoFilter.enabled") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(enabled, forKey: "videoFilter.enabled"); print("📷 [Filter] enabled=\(enabled)") }
-    }
-
-    private enum Key: String {
-        case brightness    = "videoFilter.brightness"
-        case contrast      = "videoFilter.contrast"
-        case saturation    = "videoFilter.saturation"
-        case sharpness     = "videoFilter.sharpness"
-        case blackPoint    = "videoFilter.blackPoint"
-        case redGlow       = "videoFilter.redGlow"
-        case highlightLift = "videoFilter.highlightLift"
-        case gamma         = "videoFilter.gamma"
-        case exposure      = "videoFilter.exposure"
-    }
-
-    private static func loadDefault(_ key: Key, fallback: Float) -> Float {
-        if UserDefaults.standard.object(forKey: key.rawValue) != nil {
-            return UserDefaults.standard.float(forKey: key.rawValue)
-        }
-        return fallback
-    }
-    private func saveDefault(_ key: Key, _ value: Float) {
-        UserDefaults.standard.set(value, forKey: key.rawValue)
-    }
-    private func logChange(_ name: String, _ v: Float) {
-        print("📷 [Filter] \(name) = \(String(format: "%.3f", v))")
-    }
-
-    // ⭐ 一次性批量更新（避免多次 didSet 触发）
-    //   服务端旧字段 sharpness 透传持久化但不影响 kernel
-    //   服务端旧字段 redBoost 自动映射到 redGlow
-    //   brightness 在 v3.1 重新生效 (中调曲线, 不再加法偏移)
-    func applyAll(brightness: Float?, contrast: Float?, saturation: Float?,
-                  sharpness: Float?, redBoost: Float? = nil,
-                  blackPoint: Float? = nil, redGlow: Float? = nil, highlightLift: Float? = nil,
-                  gamma: Float? = nil, exposure: Float? = nil,
-                  enabled: Bool? = nil, source: String = "remote") {
-        if let v = brightness { self.brightness = v }
-        if let v = contrast   { self.contrast   = v }
-        if let v = saturation { self.saturation = v }
-        if let v = sharpness  { self.sharpness  = v }
-        // redGlow 优先级高于 redBoost (新字段覆盖旧字段)
-        if let v = redBoost   { self.redGlow    = v }
-        if let v = redGlow    { self.redGlow    = v }
-        if let v = blackPoint { self.blackPoint = v }
-        if let v = highlightLift { self.highlightLift = v }
-        if let v = gamma      { self.gamma      = v }
-        if let v = exposure   { self.exposure   = v }
-        if let v = enabled    { self.enabled    = v }
-        print("📷 [Filter] 批量应用 (\(source)): exp=\(self.exposure) bp=\(self.blackPoint) bright=\(self.brightness) gamma=\(self.gamma) contrast=\(self.contrast) sat=\(self.saturation) redGlow=\(self.redGlow) hi=\(self.highlightLift) enabled=\(self.enabled)")
-    }
-
-    // ===== Metal CIColorKernel: 一次 dispatch 完成所有色彩运算 =====
-    //   每像素调用一次, GPU 并行, ISP 不参与
-    private static let kernelSource: String = """
-    kernel vec4 cardEnhance(__sample s,
-                            float exposure,
-                            float blackPoint,
-                            float brightness,
-                            float gamma,
-                            float contrast,
-                            float saturation,
-                            float redGlow,
-                            float highlightLift) {
-        vec3 rgb = s.rgb;
-
-        // 0. 曝光: rgb × 2^EV, 模拟"传感器多采光"
-        //    EV > 0 提亮, +1 stop = ×2; EV < 0 压暗
-        //    会让传感器噪声底 (0.02~0.05) 也被乘出来 → "黑变亮"
-        rgb = rgb * exp2(exposure);
-
-        // 1. 黑场压死: 减 bp 后归一化, < bp 的像素归 0
-        float bpDenom = max(1.0 - blackPoint, 0.001);
-        rgb = max(rgb - vec3(blackPoint), vec3(0.0)) / vec3(bpDenom);
-
-        // 2. 中调亮度: 保端点曲线, rgb=0 和 rgb=1 不变, 只弯中调
-        //    brightness > 0 提亮中调, < 0 压暗中调, = 0 无变化
-        rgb = rgb + brightness * rgb * (1.0 - rgb);
-
-        // 3. 伽马: pow 曲线 rgb^(1/gamma), 保端点
-        //    gamma > 1 提暗部 (♠♣ 花纹更亮), < 1 压暗部, = 1 无变化
-        float invGamma = 1.0 / max(gamma, 0.01);
-        rgb = pow(max(rgb, vec3(0.0)), vec3(invGamma));
-
-        // 4. 饱和度: Rec.601 luma 加权混合
-        float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
-        rgb = mix(vec3(luma), rgb, saturation);
-
-        // 5. 对比度: 绕中点 0.5
-        rgb = (rgb - 0.5) * contrast + 0.5;
-
-        // 6. 红色发光: 仅 "R 高 且 G/B 低" 的纯红像素 (♥♦), 非线性推向 1.0
-        //    黑色 (R≈0) 和白色 (R≈G≈B) 不受影响
-        float gbMax = max(rgb.g, rgb.b);
-        float redMask = smoothstep(0.4, 0.7, rgb.r) * max(0.0, 1.0 - gbMax);
-        rgb.r = rgb.r + redGlow * redMask * (1.0 - rgb.r);
-
-        // 7. 高光提亮: > 0.7 的通道非线性推向 1.0
-        vec3 highlightMask = smoothstep(vec3(0.7), vec3(1.0), rgb);
-        rgb = rgb + highlightLift * highlightMask * (1.0 - rgb);
-
-        rgb = clamp(rgb, 0.0, 1.0);
-        return vec4(rgb, s.a);
-    }
-    """
-
-    private let ciContext: CIContext
-    private var pixelBufferPool: CVPixelBufferPool?
-    private var poolWidth: Int = 0
-    private var poolHeight: Int = 0
-    private let cardEnhanceKernel: CIColorKernel?
-
-    init() {
-        let device = MTLCreateSystemDefaultDevice()
-        let options: [CIContextOption: Any] = [
-            .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any,
-            .cacheIntermediates: false,
-            .useSoftwareRenderer: false,
-        ]
-        if let device = device {
-            ciContext = CIContext(mtlDevice: device, options: options)
-        } else {
-            ciContext = CIContext(options: options)
-        }
-        cardEnhanceKernel = CIColorKernel(source: VideoFilterPipeline.kernelSource)
-        if cardEnhanceKernel == nil {
-            print("❌ [Filter] CIColorKernel 编译失败, 滤镜将走直通")
-        } else {
-            print("✅ [Filter] Metal kernel 已加载 (单 pass GPU 处理)")
-        }
-    }
-
-    /// 直通条件:
-    ///   1. enabled = false (主开关关闭)
-    ///   2. 所有参数都是中性值
-    ///   3. kernel 编译失败 (兜底)
-    var isPassThrough: Bool {
-        if !enabled { return true }
-        if cardEnhanceKernel == nil { return true }
-        return exposure == 0 && blackPoint == 0 && brightness == 0 && gamma == 1.0
-            && contrast == 1.0 && saturation == 1.0 && redGlow == 0 && highlightLift == 0
-    }
-
-    /// 处理一帧, 返回新的 CVPixelBuffer (BGRA 格式) 或 nil (失败/直通时调用方使用原帧)
-    func processFrame(_ inputPB: CVPixelBuffer) -> CVPixelBuffer? {
-        if isPassThrough { return nil }
-        guard let kernel = cardEnhanceKernel else { return nil }
-
-        let width = CVPixelBufferGetWidth(inputPB)
-        let height = CVPixelBufferGetHeight(inputPB)
-        guard width > 0 && height > 0 else { return nil }
-
-        if pixelBufferPool == nil || poolWidth != width || poolHeight != height {
-            let attrs: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey: width,
-                kCVPixelBufferHeightKey: height,
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-                kCVPixelBufferMetalCompatibilityKey: true,
-            ]
-            let poolAttrs: [CFString: Any] = [kCVPixelBufferPoolMinimumBufferCountKey: 4]
-            var pool: CVPixelBufferPool?
-            CVPixelBufferPoolCreate(kCFAllocatorDefault,
-                                    poolAttrs as CFDictionary,
-                                    attrs as CFDictionary, &pool)
-            pixelBufferPool = pool
-            poolWidth = width
-            poolHeight = height
-        }
-        guard let pool = pixelBufferPool else { return nil }
-
-        let ciImage = CIImage(cvPixelBuffer: inputPB)
-
-        // 单 pass: 所有色彩运算在一次 GPU dispatch 内完成
-        let outImage = kernel.apply(
-            extent: ciImage.extent,
-            arguments: [ciImage, exposure, blackPoint, brightness, gamma, contrast, saturation, redGlow, highlightLift]
-        )
-        guard let result = outImage else { return nil }
-
-        var outputPB: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputPB)
-        guard let out = outputPB else { return nil }
-        ciContext.render(result, to: out)
-        return out
-    }
-}
-
-// MARK: - 帧节流器（整除跳帧算法：确保帧时间戳等差分布）
-final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
-    weak var inner: RTCVideoCapturerDelegate?           // 🔥 推送输出（受后端fps控制）
-    weak var previewDelegate: RTCVideoCapturerDelegate? // 🔥 预览输出（固定60fps）
-    var videoFilter: VideoFilterPipeline?               // ⭐ 视频后处理滤镜 (CIFilter, GPU)
-
-    /// 应用后处理滤镜 — 滤镜空 / 直通模式时返回原 buffer (零开销)
-    /// 注意: WebRTC RTCCVPixelBuffer 包装的是 NV12 (kCVPixelFormatType_420YpCbCr8BiPlanar...) ,
-    /// CIFilter 处理后输出 BGRA, 编码器能接受 BGRA 直接编 H264.
-    private func applyFilter(_ frame: RTCVideoFrame) -> RTCVideoFrame {
-        guard let filter = videoFilter, !filter.isPassThrough else { return frame }
-        guard let cvBuffer = (frame.buffer as? RTCCVPixelBuffer)?.pixelBuffer else { return frame }
-        guard let processed = filter.processFrame(cvBuffer) else { return frame }
-        let newBuffer = RTCCVPixelBuffer(pixelBuffer: processed)
-        return RTCVideoFrame(
-            buffer: newBuffer,
-            rotation: frame.rotation,
-            timeStampNs: frame.timeStampNs
-        )
-    }
-    
-    // 🔥 推送FPS硬上限
-    private let maxAllowedFps: Int = 60
-    
-    // 🔥 采集FPS（外部设置，用于计算跳帧比例）
-    var captureFps: Int = 60 {
-        didSet {
-            updateAccumulatorParams()
-        }
-    }
-    
-    var targetSendFps: Int = 30 {
-        didSet {
-            // 🔥 最高60fps（无下限限制）
-            if targetSendFps > maxAllowedFps {
-                targetSendFps = maxAllowedFps
-            }
-            if targetSendFps < 1 {
-                targetSendFps = 1  // 至少1fps，避免除零
-            }
-            updateAccumulatorParams()
-            print("🎯 [FrameThrottler] 推送目标FPS变更: \(oldValue) → \(targetSendFps)")
-        }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // 🔥 累加器算法（支持任意FPS，均匀分布帧）
-    // ═══════════════════════════════════════════════════════════════════════════
-    private var sendAccumulator: Int = 0      // 推送累加器
-    private var previewAccumulator: Int = 0   // 预览累加器
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // 🔥 方案B：90k RTP时钟（行业标准，无累积误差）
-    // ═══════════════════════════════════════════════════════════════════════════
-    // RTP 标准用 90kHz 时钟，常见FPS都能整除：
-    // 60fps: 90000/60 = 1500 ticks/帧
-    // 30fps: 90000/30 = 3000 ticks/帧
-    // 25fps: 90000/25 = 3600 ticks/帧
-    // 20fps: 90000/20 = 4500 ticks/帧
-    // 15fps: 90000/15 = 6000 ticks/帧
-    private let rtpClockRate: Int64 = 90_000        // RTP 90kHz 时钟
-    private var rtp90kTimestamp: Int64 = 0          // 当前 90k 时间戳
-    private var rtp90kStep: Int64 = 1500            // 每帧步进（90000/fps）
-    private var isFirstFrame: Bool = true           // 是否第一帧
-    
-    // 🔥 预览 15fps (从 60 降下来 - 业主只是看个画面证明在采集, 真正画面 PC 端拉)
-    //   降本: MTKView 渲染 -75%, 整机发热显著下降
-    private let previewFps: Int = 15
-    private var previewSentCounter: Int = 0
-    
-    // 🔥 采集帧率检测（用于自动调整跳帧比例）
-    private var detectedCaptureFps: Int = 60
-    private var captureFpsDetectCounter: Int = 0
-    private var captureFpsDetectStartTime: Double = 0
-    
-    var fpsReportHandler: ((Int, Int) -> Void)?
-    private var lastReportTsSec: Double = 0
-    private var captureCounter: Int = 0
-    private var sentCounter: Int = 0
-    private var lastFrameWidth: Int32 = 0
-    private var lastFrameHeight: Int32 = 0
-    private var lastOriginalRotation: RTCVideoRotation = ._0
-    
-    // 🔥 前置摄像头镜像标志
-    var isFrontCamera: Bool = false
-    
-    // 🔥 当前档位信息（用于日志）
-    var currentProfileName: String = "unknown"
-    var expectedCaptureWidth: Int = 0
-    var expectedCaptureHeight: Int = 0
-    var expectedOutputWidth: Int = 0
-    var expectedOutputHeight: Int = 0
-    var currentScaleDown: Double = 1.0
-    
-    // 🔥 首帧标记（用于唤醒检测）
-    var hasReceivedFrame: Bool = false
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // 🔥 诊断计数器（原子操作，不阻塞采集线程）
-    // ═══════════════════════════════════════════════════════════════════════════
-    private var diagCapCount: Int = 0   // 摄像头回调计数
-    private var diagPushCount: Int = 0  // 实际喂给 WebRTC 的帧数
-    private var diagTimer: Timer?       // 独立诊断定时器（不在采集队列）
-    private let diagQueue = DispatchQueue(label: "fps.diag", qos: .utility)
-    
-    override init() {
-        super.init()
-        updateAccumulatorParams()
-        startDiagTimer()
-    }
-    
-    deinit {
-        stopDiagTimer()
-    }
-    
-    // 🔥 启动诊断定时器（独立线程，每秒输出一次）
-    private func startDiagTimer() {
-        stopDiagTimer()
-        diagTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            // 🔥 在独立队列打印，不影响任何关键线程
-            self.diagQueue.async {
-                let cap = self.diagCapCount
-                let push = self.diagPushCount
-                let target = self.targetSendFps
-                
-                // 重置计数
-                self.diagCapCount = 0
-                self.diagPushCount = 0
-                
-                // 🔥 诊断输出（已禁用）
-                // let capStatus = cap > 0 ? "✅" : "❌"
-                // let pushStatus = push == target ? "✅" : (push < target ? "⚠️少\(target - push)" : "⚠️多\(push - target)")
-                // print("🔬 [诊断] cap=\(cap) \(capStatus) | push=\(push)/\(target) \(pushStatus)")
-                _ = (cap, push, target)  // 避免未使用变量警告
-            }
-        }
-    }
-    
-    private func stopDiagTimer() {
-        diagTimer?.invalidate()
-        diagTimer = nil
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════
-    // MARK: - 🔥 累加器算法（核心：支持任意FPS + 等差时间戳）
-    // ═══════════════════════════════════════════════════════════════════════════
-    
-    /// 更新累加器参数
-    private func updateAccumulatorParams() {
-        let captureRate = max(1, captureFps)
-        let targetRate = max(1, min(targetSendFps, maxAllowedFps))
-        
-        // 🔥 方案B：计算 90k RTP 时钟步进
-        // 90000/fps = 每帧步进的 ticks
-        rtp90kStep = rtpClockRate / Int64(targetRate)
-        
-        // 转换为毫秒用于日志显示
-        let intervalMs = Double(rtp90kStep) * 1000.0 / Double(rtpClockRate)
-        
-        print("📊 [FrameThrottler] 90k RTP时钟参数更新:")
-        print("   采集=\(captureRate)fps")
-        print("   推送=\(targetRate)fps")
-        print("   90k步进=\(rtp90kStep) ticks/帧 (间隔\(String(format: "%.3f", intervalMs))ms)")
-        print("   预览=\(previewFps)fps")
-        
-        // 检查是否能整除
-        if rtpClockRate % Int64(targetRate) != 0 {
-            print("⚠️ [FrameThrottler] 警告: \(targetRate)fps 不能整除90000，可能有微小误差")
-        }
-        
-        // 重置累加器
-        sendAccumulator = 0
-        previewAccumulator = 0
-    }
-    
-    /// 🔥 累加器判断：是否应该发送这一帧
-    /// 原理：每采集一帧，累加 targetFps，当累加值 >= captureFps 时发送并减去 captureFps
-    /// 这样可以将 targetFps 帧均匀分布在 captureFps 帧中
-    private func shouldSendPushFrame() -> Bool {
-        sendAccumulator += targetSendFps
-        if sendAccumulator >= captureFps {
-            sendAccumulator -= captureFps
-            return true
-        }
-        return false
-    }
-    
-    /// 预览累加器判断
-    private func shouldSendPreviewFrame() -> Bool {
-        previewAccumulator += previewFps
-        if previewAccumulator >= captureFps {
-            previewAccumulator -= captureFps
-            return true
-        }
-        return false
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // MARK: - RTCVideoCapturerDelegate（采集回调）
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    func capturer(_ capturer: RTCVideoCapturer, didCapture videoFrame: RTCVideoFrame) {
-        let nowSec = CFAbsoluteTimeGetCurrent()
-        
-        // 采集计数
-        captureCounter += 1
-        diagCapCount += 1  // 🔥 诊断：摄像头回调计数
-        
-        // 记录帧尺寸和旋转（用于日志）
-        lastFrameWidth = videoFrame.width
-        lastFrameHeight = videoFrame.height
-        lastOriginalRotation = videoFrame.rotation
-        
-        // 🔥 第一帧标记（90k时钟从0开始，不需要基准）
-        if isFirstFrame {
-            isFirstFrame = false
-            hasReceivedFrame = true  // 🔥 标记已收到帧（用于唤醒检测）
-            let step = rtp90kStep
-            DispatchQueue.global(qos: .utility).async {
-                print("🎬 [FrameThrottler] 首帧，90k RTP时钟从0开始，步进=\(step)")
-            }
-        }
-        
-        // 🔥 检测实际采集帧率（每秒更新一次）
-        captureFpsDetectCounter += 1
-        if captureFpsDetectStartTime == 0 {
-            captureFpsDetectStartTime = nowSec
-        } else if nowSec - captureFpsDetectStartTime >= 1.0 {
-            let newDetectedFps = captureFpsDetectCounter
-            
-            // 🔥 如果检测到的FPS与设置的不同，异步打印警告
-            if abs(newDetectedFps - captureFps) > 5 {
-                let detected = newDetectedFps
-                let expected = captureFps
-                DispatchQueue.global(qos: .utility).async {
-                    print("⚠️ [FrameThrottler] 检测FPS(\(detected))与设置FPS(\(expected))差距较大")
-                }
-            }
-            
-            detectedCaptureFps = max(1, newDetectedFps)
-            captureFpsDetectCounter = 0
-            captureFpsDetectStartTime = nowSec
-        }
-        
-        // ========== 🔥 预览输出：累加器算法 ==========
-        if shouldSendPreviewFrame() {
-            sendPreviewFrame(capturer, videoFrame: videoFrame)
-        }
-        
-        // ========== 🔥 推送输出：累加器算法 + 等差时间戳 ==========
-        if shouldSendPushFrame() {
-            sendFrameWithArithmeticTimestamp(capturer, videoFrame: videoFrame)
-        }
-        
-        // 每秒上报一次采集/推送FPS（异步，不阻塞采集线程）
-        if lastReportTsSec == 0 { lastReportTsSec = nowSec }
-        if (nowSec - lastReportTsSec) >= 1.0 {
-            let cap = captureCounter
-            let snd = sentCounter
-            let width = lastFrameWidth
-            let height = lastFrameHeight
-            let expCaptureW = expectedCaptureWidth
-            let expCaptureH = expectedCaptureHeight
-            let expOutputW = expectedOutputWidth
-            let expOutputH = expectedOutputHeight
-            let scale = currentScaleDown
-            let targetFps = targetSendFps
-            let step = rtp90kStep
-            let clock = rtpClockRate
-            
-            // 🔥 FPS回调移到主线程
-            DispatchQueue.main.async { [weak self] in
-                self?.fpsReportHandler?(cap, snd)
-            }
-            
-            // 🔥 日志已禁用（避免任何潜在影响）
-            // DispatchQueue.global(qos: .utility).async {
-            //     let captureMatch = (Int(width) == expCaptureW && Int(height) == expCaptureH) ? "✅" : "❌"
-            //     let intervalMs = Double(step) * 1000.0 / Double(clock)
-            //     print("📡 推流: 采集=\(width)x\(height) \(captureMatch) → 输出=\(expOutputW)x\(expOutputH) (scale=\(scale)) | FPS: \(cap)→\(snd)/\(targetFps) (90k步进=\(step), \(String(format: "%.2f", intervalMs))ms)")
-            // }
-            
-            captureCounter = 0
-            sentCounter = 0
-            previewSentCounter = 0
-            lastReportTsSec = nowSec
-        }
-    }
-    
-    // 🔥 发送到预览 — 只跑原帧, 不应用 CIFilter
-    //   原因: 真正的画面 PC 端会拉到, 滤镜效果在 PC 看到即可; iOS 本地预览跳过滤镜
-    //   收益: 每帧少一次 GPU dispatch (现在单 kernel 也省一次), ISP 不参与, 整机降温
-    private func sendPreviewFrame(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
-        previewSentCounter += 1
-
-        let fixedFrame = RTCVideoFrame(
-            buffer: videoFrame.buffer,
-            rotation: ._0,
-            timeStampNs: videoFrame.timeStampNs
-        )
-        previewDelegate?.capturer(capturer, didCapture: fixedFrame)
-    }
-
-    // 🔥 发送到推送（使用 90k RTP 时钟，无累积误差）
-    private func sendFrameWithArithmeticTimestamp(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
-        sentCounter += 1
-        diagPushCount += 1  // 🔥 诊断：实际喂给 WebRTC 的帧数
-
-        // 🔥 方案B：90k RTP 时钟 → 纳秒
-        let timestampNs = rtp90kTimestamp * 1_000_000_000 / rtpClockRate
-        rtp90kTimestamp += rtp90kStep
-
-        // ⭐ 滤镜后处理
-        let filtered = applyFilter(videoFrame)
-        let fixedFrame = RTCVideoFrame(
-            buffer: filtered.buffer,
-            rotation: ._0,
-            timeStampNs: timestampNs
-        )
-        inner?.capturer(capturer, didCapture: fixedFrame)
-    }
-
-    // 🔥 发送到推送（保留原始时间戳，备用）
-    private func sendFrame(_ capturer: RTCVideoCapturer, videoFrame: RTCVideoFrame) {
-        sentCounter += 1
-
-        // ⭐ 滤镜后处理
-        let filtered = applyFilter(videoFrame)
-        let fixedFrame = RTCVideoFrame(
-            buffer: filtered.buffer,
-            rotation: ._0,
-            timeStampNs: videoFrame.timeStampNs
-        )
-        inner?.capturer(capturer, didCapture: fixedFrame)
-    }
-    
-    /// 重置节流器状态
-    func reset() {
-        // 重置累加器
-        sendAccumulator = 0
-        previewAccumulator = 0
-        
-        // 重置 90k RTP 时钟
-        rtp90kTimestamp = 0
-        isFirstFrame = true
-        
-        // 重置统计
-        lastReportTsSec = 0
-        captureCounter = 0
-        sentCounter = 0
-        previewSentCounter = 0
-        captureFpsDetectCounter = 0
-        captureFpsDetectStartTime = 0
-    }
-    
-    /// 停止（兼容旧接口）
-    func stop() {
-        reset()
-    }
-}
-
 // MARK: - 阶梯档位（动态根据摄像头能力）
 enum LadderProfile: Int, CaseIterable {
     case low       // 低清
@@ -1334,67 +704,185 @@ final class WebRTCManager: NSObject, ObservableObject {
             print("⚠️ [applyShutterSpeedChange] device 不存在")
             return
         }
-        
-        // 🔥 直接使用 cjfpsValue（后端下发 60-600）
-        let targetShutterSpeed = cjfpsValue
-        
+
+        // P2同步：防频闪对齐（从 D:\sb\ios 同步）
+        let snappedShutter = snapToAntiFlicker(cjfpsValue)
+
         do {
             try device.lockForConfiguration()
-            
+
             if device.isExposureModeSupported(.custom) {
-                let duration = CMTime(value: 1, timescale: CMTimeScale(targetShutterSpeed))
-                
+                let duration = CMTime(value: 1, timescale: CMTimeScale(snappedShutter))
+
                 let minDuration = device.activeFormat.minExposureDuration
                 let maxDuration = device.activeFormat.maxExposureDuration
-                
+
                 let safeDuration: CMTime
                 let actualShutterSpeed: Int
                 if duration < minDuration {
                     safeDuration = minDuration
                     actualShutterSpeed = Int(1.0 / CMTimeGetSeconds(safeDuration))
-                    print("📸 快门调整: cjfps=\(cjfpsValue) → 1/\(actualShutterSpeed)s (硬件最快)")
                 } else if duration > maxDuration {
                     safeDuration = maxDuration
                     actualShutterSpeed = Int(1.0 / CMTimeGetSeconds(safeDuration))
-                    print("📸 快门调整: cjfps=\(cjfpsValue) → 1/\(actualShutterSpeed)s (硬件最慢)")
                 } else {
                     safeDuration = duration
-                    actualShutterSpeed = targetShutterSpeed
-                    print("📸 快门调整: cjfps=\(cjfpsValue) → 1/\(actualShutterSpeed)s")
+                    actualShutterSpeed = snappedShutter
                 }
-                
-                // 🔥 ISO 固定为合理值，亮度由 cjfps（快门速度）控制
-                // cjfps 越大（快门越快）→ 越暗
-                // cjfps 越小（快门越慢）→ 越亮
+
                 let minISO = device.activeFormat.minISO
                 let maxISO = device.activeFormat.maxISO
-                // 使用 1/3 位置的 ISO，提供正常亮度
-                // ⭐ ISO 选择:
-                //   autoIsoEnabled=true  → 用当前 device.iso (闭环 timer 已在持续调整, 别覆盖它)
-                //   autoIsoEnabled=false → 中位 ISO (max-min)/2, 比之前 1/3 位亮 1 档
                 let fixedISO: Float
                 if autoIsoEnabled {
-                    fixedISO = device.iso       // 保留闭环值, 后续 timer 会继续微调
+                    fixedISO = device.iso
                 } else {
                     fixedISO = minISO + (maxISO - minISO) / 2
                 }
                 device.setExposureModeCustom(duration: safeDuration, iso: fixedISO, completionHandler: nil)
-                print("📸 曝光设置: 快门=1/\(cjfpsValue)s, ISO=\(fixedISO) [\(autoIsoEnabled ? "auto闭环" : "中位")] 范围\(minISO)-\(maxISO)")
-                
-                // 🔥🔥 关键：显式锁定帧率，防止手动曝光后帧率被自动降低
-                // 直接使用 currentCaptureFPS（采集时已正确设置）
-                let targetFps = currentCaptureFPS
-                if targetFps > 0 {
-                    let frameDuration = CMTime(value: 1, timescale: CMTimeScale(targetFps))
-                    device.activeVideoMinFrameDuration = frameDuration
-                    device.activeVideoMaxFrameDuration = frameDuration
-                    print("📹 帧率锁定: \(targetFps)fps")
-                }
+                print("📸 [快门优先] 快门=1/\(actualShutterSpeed)s(snap:\(cjfpsValue)→\(snappedShutter)), ISO=\(Int(fixedISO))[\(autoIsoEnabled ? "闭环" : "中位")]")
+
+                let targetFps = max(currentCaptureFPS, 15)
+                let frameDuration = CMTime(value: 1, timescale: CMTimeScale(targetFps))
+                device.activeVideoMinFrameDuration = frameDuration
+                device.activeVideoMaxFrameDuration = frameDuration
             }
-            
+
             device.unlockForConfiguration()
         } catch {
             print("❌ [快门调整] 失败: \(error.localizedDescription)")
+        }
+
+        if autoIsoEnabled { startAutoIsoLoop() }
+    }
+
+    /// 将快门速度对齐到防频闪安全值（50Hz/60Hz 整数倍）
+    private func snapToAntiFlicker(_ shutterSpeed: Int) -> Int {
+        let safe50Hz = stride(from: 50, through: 600, by: 50).map { $0 }
+        let safe60Hz = stride(from: 60, through: 600, by: 60).map { $0 }
+        let allSafe = Array(Set(safe50Hz + safe60Hz)).sorted()
+        let nearest = allSafe.min(by: { abs($0 - shutterSpeed) < abs($1 - shutterSpeed) }) ?? shutterSpeed
+        return nearest
+    }
+
+    // MARK: - ⭐ P2: 240fps 双模式切换
+
+    /// 当前是否处于 240fps 高速模式
+    @Published var isHighSpeedMode: Bool = false
+
+    /// 切换到 240fps 高速模式（640x640 低分辨率 + 高帧率）
+    @MainActor
+    func switchTo240fps() {
+        guard let device = getCurrentCaptureDevice() else {
+            print("❌ [240fps] 无法获取摄像头设备")
+            return
+        }
+
+        // 1. 选择支持 240fps 的 format
+        let target240Format = device.formats.first { format in
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return dims.width >= 1280 &&
+                   format.videoSupportedFrameRateRanges.contains {
+                       $0.maxFrameRate >= 240
+                   }
+        }
+
+        guard let format = target240Format else {
+            print("❌ [240fps] 设备不支持 240fps 采集")
+            return
+        }
+
+        do {
+            try device.lockForConfiguration()
+            device.activeFormat = format
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 240)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 240)
+            device.unlockForConfiguration()
+        } catch {
+            print("❌ [240fps] 切换失败: \(error)")
+            return
+        }
+
+        // 2. FrameThrottler 提升上限并设置目标
+        frameThrottler?.setMaxAllowedFps(240)
+        frameThrottler?.captureFps = 240
+        frameThrottler?.targetSendFps = 240
+
+        // 3. WebRTC 编码器参数
+        for (_, pc) in p2pViewerSessions {
+            if let sender = pc.senders.first(where: { $0.track?.kind == "video" }) {
+                let params = sender.parameters
+                if let encoding = params.encodings.first {
+                    encoding.maxFramerate = NSNumber(value: 240)
+                    encoding.maxBitrateBps = NSNumber(value: 5_000_000)
+                    encoding.minBitrateBps = NSNumber(value: 5_000_000)
+                }
+                sender.parameters = params
+            }
+        }
+
+        isHighSpeedMode = true
+        print("✅ [240fps] 已切换到高速模式 (640x640@240fps)")
+
+        // 4. 通知 PC 端
+        WebSocketManager.shared.sendMessage(
+            destination: "/app/device/fps-mode",
+            payload: ["mode": "240fps", "fps": 240, "resolution": "640x640"]
+        )
+    }
+
+    /// 恢复普通模式（1080p@30fps）
+    @MainActor
+    func switchToNormal() {
+        guard let device = getCurrentCaptureDevice() else { return }
+
+        do {
+            try device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            device.unlockForConfiguration()
+        } catch {
+            print("❌ [普通模式] 切换失败: \(error)")
+            return
+        }
+
+        frameThrottler?.setMaxAllowedFps(60)
+        frameThrottler?.captureFps = 30
+        frameThrottler?.targetSendFps = targetOutputFPS
+
+        for (_, pc) in p2pViewerSessions {
+            if let sender = pc.senders.first(where: { $0.track?.kind == "video" }) {
+                let params = sender.parameters
+                if let encoding = params.encodings.first {
+                    encoding.maxFramerate = NSNumber(value: 30)
+                    encoding.maxBitrateBps = NSNumber(value: 3_000_000)
+                    encoding.minBitrateBps = NSNumber(value: 3_000_000)
+                }
+                sender.parameters = params
+            }
+        }
+
+        isHighSpeedMode = false
+        print("✅ [普通模式] 已恢复 (1080p@30fps)")
+
+        WebSocketManager.shared.sendMessage(
+            destination: "/app/device/fps-mode",
+            payload: ["mode": "standard", "fps": 30, "resolution": "1080p"]
+        )
+    }
+
+    /// 温度监控：过热自动降级
+    func startThermalMonitor() {
+        NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            let state = ProcessInfo.processInfo.thermalState
+            if state == .serious || state == .critical {
+                print("🌡️ 温度过高，自动切回普通模式")
+                Task { @MainActor in
+                    self?.switchToNormal()
+                }
+            }
         }
     }
 
@@ -2509,8 +1997,8 @@ final class WebRTCManager: NSObject, ObservableObject {
     // 2. 检测丢包率 < 阈值，连续M秒 → 恢复FPS
     // 3. FPS变化时通知PC端，PC端调整缓存策略
     
-    /// 自适应FPS开关（默认开启，基于丢包率动态调整推流FPS）
-    var adaptiveFpsEnabled: Bool = true
+    /// 自适应FPS开关（P0修复：默认关闭，避免与WebRTC BWE互相打架导致死亡螺旋）
+    var adaptiveFpsEnabled: Bool = false
     
     /// 当前自适应FPS值（独立于后端下发的targetOutputFPS）
     private var adaptiveFps: Int = 30
@@ -5905,14 +5393,15 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
                 // ★ 细节2：打洞失败处理 — 先尝试 ICE Restart
                 self.retryICEConnection(for: pcDeviceId, peerConnection: peerConnection)
             case .disconnected:
-                print("⚠️ ICE[\(pcDeviceId)]: Disconnected")
-                // 短暂断开可能恢复（如网络切换），等待 5 秒
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-                    // 5 秒后仍然断开，则移除
-                    if let session = self.p2pViewerSessions[pcDeviceId],
-                       session.iceConnectionState == .disconnected || session.iceConnectionState == .failed {
-                        print("❌ ICE[\(pcDeviceId)]: 5秒后仍断开，移除会话")
-                        self.removeViewerSession(pcDeviceId)
+                print("⚠️ ICE[\(pcDeviceId)]: Disconnected — 等待 WebRTC 自愈 (15秒超时)")
+                // P0修复：延长等待时间，给 WebRTC 充分的自愈机会
+                // WiFi 切换通常 3-10 秒恢复，5 秒太短
+                DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) {
+                    guard let session = self.p2pViewerSessions[pcDeviceId] else { return }
+                    if session.iceConnectionState == .disconnected || session.iceConnectionState == .failed {
+                        print("⚠️ ICE[\(pcDeviceId)]: 15秒后仍断开，尝试 ICE Restart")
+                        // 不直接移除会话，先尝试 ICE Restart
+                        self.retryICEConnection(for: pcDeviceId, peerConnection: session)
                     }
                 }
             case .closed:

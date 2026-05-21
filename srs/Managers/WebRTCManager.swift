@@ -193,6 +193,7 @@ final class WebRTCManager: NSObject, ObservableObject {
     private let maxICERetries = 2  // 最多重试2次
     private var p2pViewerSenders: [String: RTCRtpSender] = [:]         // pcDeviceId → VideoSender（用于码率控制）
     private var pendingRemoteIceCandidates: [String: [RTCIceCandidate]] = [:]  // ★ 缓存 PC 的 ICE 候选者（等待 remoteDescription 设置后再添加）
+    private var pendingIceRestart: Set<String> = []  // ★ ICE Restart 进行中的 pcDeviceId（等待新 Answer）
     var maxP2PViewers: Int = 4                   // 最大同时观看人数（后端可配置）
     var forceRelay: Bool = false                  // ★ 强制走 TURN 中继（后台开关，测试用）
     var isReadyForViewers: Bool = false           // 视频轨道已就绪，可以接受观看请求
@@ -5221,7 +5222,10 @@ final class WebRTCManager: NSObject, ObservableObject {
                     } else {
                         print("✅ [P2P] PC \(fromDevice) Answer 设置成功，连接建立中...")
 
-                        // ★ 刷入缓存的 ICE 候选者（之前因 remoteDescription 为空而缓存的）
+                        // ★ 清除 ICE Restart 标志（新 Answer 已设置，可以接受 ICE 候选者了）
+                        self.pendingIceRestart.remove(fromDevice)
+
+                        // ★ 刷入缓存的 ICE 候选者（之前因 remoteDescription 为空或 ICE Restart 而缓存的）
                         if let pending = self.pendingRemoteIceCandidates[fromDevice], !pending.isEmpty {
                             print("📦 [P2P] 刷入 PC \(fromDevice) 缓存的 \(pending.count) 个 ICE 候选者")
                             for ice in pending {
@@ -5268,13 +5272,14 @@ final class WebRTCManager: NSObject, ObservableObject {
             let ice = RTCIceCandidate(sdp: candidate,
                                        sdpMLineIndex: sdpMLineIndex,
                                        sdpMid: sdpMid)
-            // ★ 如果 remoteDescription 还没设置（PC 的 Answer 还没到），先缓存
-            if viewerPC.remoteDescription == nil {
+            // ★ 如果 remoteDescription 还没设置 或 ICE Restart 进行中（等待新 Answer），先缓存
+            if viewerPC.remoteDescription == nil || pendingIceRestart.contains(fromDevice) {
                 if pendingRemoteIceCandidates[fromDevice] == nil {
                     pendingRemoteIceCandidates[fromDevice] = []
                 }
                 pendingRemoteIceCandidates[fromDevice]?.append(ice)
-                print("📦 [P2P] 缓存 PC \(fromDevice) ICE（等待 remoteDescription），已缓存 \(pendingRemoteIceCandidates[fromDevice]?.count ?? 0) 个")
+                let reason = viewerPC.remoteDescription == nil ? "等待remoteDescription" : "ICE Restart中"
+                print("📦 [P2P] 缓存 PC \(fromDevice) ICE（\(reason)），已缓存 \(pendingRemoteIceCandidates[fromDevice]?.count ?? 0) 个")
             } else {
                 viewerPC.add(ice) { error in
                     if let error = error {
@@ -5514,6 +5519,8 @@ extension WebRTCManager: RTCPeerConnectionDelegate {
                     print("❌ [P2P] ICE Restart Offer 失败: \(err?.localizedDescription ?? "nil")")
                     return
                 }
+                // ★ 标记 ICE Restart 进行中，缓冲后续 ICE 候选者直到收到新 Answer
+                self.pendingIceRestart.insert(pcDeviceId)
                 peerConnection.setLocalDescription(sdp) { _ in }
                 WebSocketManager.shared.sendWebRTCSignalingSDP(
                     sdpType: "offer",

@@ -866,8 +866,18 @@ final class WebRTCManager: NSObject, ObservableObject {
         let pushFps = frameThrottler?.targetSendFps ?? 30
         let restoreFps = max(pushFps, 15)
 
+        // 1. 先切回支持低帧率的普通 format（240fps format 最低帧率可能是120fps，直接设30会卡死）
+        let normalFormat = device.formats.first { format in
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return dims.width >= 1920 &&
+                   format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 15 && $0.maxFrameRate >= Double(restoreFps) }
+        }
+
         do {
             try device.lockForConfiguration()
+            if let fmt = normalFormat {
+                device.activeFormat = fmt
+            }
             device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(restoreFps))
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(restoreFps))
             device.unlockForConfiguration()

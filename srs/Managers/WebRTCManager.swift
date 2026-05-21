@@ -822,12 +822,6 @@ final class WebRTCManager: NSObject, ObservableObject {
 
         isHighSpeedMode = true
         print("✅ [240fps] 已切换到高速模式 (640x640@240fps)")
-
-        // 4. 通知 PC 端
-        WebSocketManager.shared.sendMessage(
-            destination: "/app/device/fps-mode",
-            payload: ["mode": "240fps", "fps": 240, "resolution": "640x640"]
-        )
     }
 
     /// 恢复普通模式（1080p@30fps）
@@ -863,11 +857,6 @@ final class WebRTCManager: NSObject, ObservableObject {
 
         isHighSpeedMode = false
         print("✅ [普通模式] 已恢复 (1080p@30fps)")
-
-        WebSocketManager.shared.sendMessage(
-            destination: "/app/device/fps-mode",
-            payload: ["mode": "standard", "fps": 30, "resolution": "1080p"]
-        )
     }
 
     /// 温度监控：过热自动降级

@@ -863,10 +863,13 @@ final class WebRTCManager: NSObject, ObservableObject {
     func switchToNormal() {
         guard let device = getCurrentCaptureDevice() else { return }
 
+        let pushFps = frameThrottler?.targetSendFps ?? 30
+        let restoreFps = max(pushFps, 15)
+
         do {
             try device.lockForConfiguration()
-            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(restoreFps))
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(restoreFps))
             device.unlockForConfiguration()
         } catch {
             print("❌ [普通模式] 切换失败: \(error)")

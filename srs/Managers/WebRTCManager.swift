@@ -2758,8 +2758,14 @@ final class WebRTCManager: NSObject, ObservableObject {
         print("🔔 [P2P-DEBUG] createViewerSession 开始, pcDeviceId=\(pcDeviceId)")
 
         // 1. 检查是否已有该 PC 的会话
-        if p2pViewerSessions[pcDeviceId] != nil {
-            print("⚠️ [P2P] PC \(pcDeviceId) 已有会话，先关闭旧会话")
+        if let existingPC = p2pViewerSessions[pcDeviceId] {
+            let state = existingPC.connectionState
+            if state == .new || state == .connecting {
+                // 会话正在建立中，忽略重复请求（防止 PC 重试导致关闭正在连接的会话）
+                print("⚠️ [P2P] PC \(pcDeviceId) 会话正在建立中(state=\(state.rawValue))，忽略重复请求")
+                return
+            }
+            print("⚠️ [P2P] PC \(pcDeviceId) 已有会话(state=\(state.rawValue))，关闭旧会话")
             removeViewerSession(pcDeviceId)
         }
         

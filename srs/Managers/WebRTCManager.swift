@@ -2303,9 +2303,23 @@ final class WebRTCManager: NSObject, ObservableObject {
     private func restartAllIceForNetworkSwitch() {
         let sessions = p2pViewerSessions  // 拷贝快照
         if sessions.isEmpty { return }
-        print("📶 [Network] 网络切换，对 \(sessions.count) 个 P2P 会话发起 ICE Restart")
+        print("📶 [Network] 网络切换，对 \(sessions.count) 个 P2P 会话发起重连")
         for (pcDeviceId, pc) in sessions {
-            self.retryICEConnection(for: pcDeviceId, peerConnection: pc)
+            let state = pc.connectionState
+            if state == .closed || state == .failed {
+                // PeerConnection 已关闭/失败，不能 ICE Restart，需要完全重建
+                print("📶 [Network] PC \(pcDeviceId) 连接已 closed/failed，移除旧会话并通知 PC 重连")
+                removeViewerSession(pcDeviceId)
+                // 通知 PC 端重新发起连接请求
+                WebSocketManager.shared.sendWebRTCSignaling(
+                    type: "WEBRTC_HANGUP",
+                    reason: "network_switch_reconnect",
+                    toDevice: pcDeviceId
+                )
+            } else {
+                // 连接还活着，尝试 ICE Restart
+                self.retryICEConnection(for: pcDeviceId, peerConnection: pc)
+            }
         }
     }
     

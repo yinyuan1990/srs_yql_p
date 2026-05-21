@@ -82,6 +82,7 @@ struct IceServer: Codable {
 // MARK: - P2P WebRTC 信令通知名
 extension Notification.Name {
     static let webrtcSignalingReceived = Notification.Name("webrtcSignalingReceived")
+    static let webSocketDidReconnect = Notification.Name("webSocketDidReconnect")
 }
 
 // MARK: - 阶梯档位（动态根据摄像头能力）
@@ -2187,6 +2188,15 @@ final class WebRTCManager: NSObject, ObservableObject {
         loadTokenIfNeeded() // 动态流名：使用你的读取逻辑
         NotificationCenter.default.addObserver(self, selector: #selector(onLogoutRequired),
                                                name: NSNotification.Name("LogoutRequired"), object: nil)
+
+        // WebSocket 重连后触发 ICE Restart（修复 WiFi→5G 网络切换后画面断连）
+        NotificationCenter.default.addObserver(forName: .webSocketDidReconnect, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            if !self.p2pViewerSessions.isEmpty {
+                print("📶 [WebSocket重连] 检测到 \(self.p2pViewerSessions.count) 个活跃P2P会话，触发 ICE Restart")
+                self.restartAllIceForNetworkSwitch()
+            }
+        }
         
         // 🔥 强制重新加载本地缓存的配置（确保获取最新的）
         ConfigManager.shared.loadCachedThinConfig()

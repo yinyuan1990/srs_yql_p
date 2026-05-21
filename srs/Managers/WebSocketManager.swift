@@ -491,10 +491,13 @@ extension WebSocketManager: SwiftStompDelegate {
         //print("✅ STOMP连接成功")
         updateConnectionState(.connected)
         stopReconnectTimer()
-        
+
         // 订阅
         subscribeToDeviceConfig()
         isConnected = true
+
+        // WebSocket 重连后通知 WebRTCManager 做 ICE Restart（修复 WiFi→5G 断连）
+        NotificationCenter.default.post(name: .webSocketDidReconnect, object: nil)
         
         // 订阅用户心跳回执（用户目的地固定写 /user/queue/heartbeat）
         swiftStomp.subscribe(to: "/user/queue/heartbeat")

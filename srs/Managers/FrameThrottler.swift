@@ -273,9 +273,15 @@ final class FrameThrottler: NSObject, RTCVideoCapturerDelegate {
         diagPushCount += 1
         let timestampNs = rtp90kTimestamp * 1_000_000_000 / rtpClockRate
         rtp90kTimestamp += rtp90kStep
-        let filtered = applyFilter(videoFrame)
+        // 240fps 模式跳过滤镜（滤镜处理>4ms，会拖慢帧率）
+        let outputFrame: RTCVideoFrame
+        if targetSendFps >= 240 {
+            outputFrame = videoFrame
+        } else {
+            outputFrame = applyFilter(videoFrame)
+        }
         let fixedFrame = RTCVideoFrame(
-            buffer: filtered.buffer,
+            buffer: outputFrame.buffer,
             rotation: ._0,
             timeStampNs: timestampNs
         )

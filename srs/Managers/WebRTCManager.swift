@@ -2840,6 +2840,8 @@ final class WebRTCManager: NSObject, ObservableObject {
                        : (peerType == "cellular" ? "对端PC蜂窝(CGNAT)"
                        : "ICE 失败黑名单"))
             print("⚠️ [P2P] 强制中继模式: pc=\(pcDeviceId), 原因=\(reason)")
+        } else {
+            print("🔍 [TURN验证] ⚠️ 非relay模式 — isOnCellular=\(isOnCellular), peerNet=\(peerNetworkType[pcDeviceId] ?? "unknown"), 黑名单=\(forceRelayPeerIds.contains(pcDeviceId)), forceRelay=\(forceRelay) → 5G+WiFi直连必败！")
         }
         cfg.bundlePolicy = .maxBundle
         cfg.rtcpMuxPolicy = .require
@@ -5292,6 +5294,13 @@ final class WebRTCManager: NSObject, ObservableObject {
             let ice = RTCIceCandidate(sdp: candidate,
                                        sdpMLineIndex: sdpMLineIndex,
                                        sdpMid: sdpMid)
+            // [TURN验证] 打印PC发来的候选类型
+            let remoteIceType = candidate.contains("typ relay") ? "relay🔁(TURN中继)" : (candidate.contains("typ srflx") ? "srflx🌐(NAT穿透)" : (candidate.contains("typ host") ? "host🏠(直连)" : "unknown"))
+            if candidate.contains("typ relay") {
+                print("✅ [TURN验证] PC \(fromDevice) 发来 TURN relay 候选 → TURN服务器正常工作！")
+            } else {
+                print("📥 [TURN验证] PC \(fromDevice) ICE候选类型: \(remoteIceType)")
+            }
             // ★ 如果 remoteDescription 还没设置 或 ICE Restart 进行中（等待新 Answer），先缓存
             if viewerPC.remoteDescription == nil || pendingIceRestart.contains(fromDevice) {
                 if pendingRemoteIceCandidates[fromDevice] == nil {

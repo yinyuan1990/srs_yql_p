@@ -579,6 +579,21 @@ extension WebSocketManager: SwiftStompDelegate {
                 handleSetFpsCommand(messageDict: msgDict)
             }
 
+            // 抗频闪指令：PC 端开关 + 帧率档位（从 config 对象里提取）
+            if let config = msgDict?["config"] as? [String: Any],
+               let cmd = config["cmd"] as? String, cmd == "anti_flicker" {
+                let enabled = config["enabled"] as? Bool ?? false
+                let fps = config["fps"] as? Int ?? 80
+                print("🔦 [anti_flicker] 收到PC指令: enabled=\(enabled), fps=\(fps)")
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: NSNotification.Name("AntiFlickerCommand"),
+                        object: nil,
+                        userInfo: ["enabled": enabled, "fps": fps]
+                    )
+                }
+            }
+
             // ⭐ 处理 PC 端推送的视频滤镜热更新
             //   协议: { "cmd": "set_filter", "brightness": 0.1, "contrast": 1.15,
             //           "saturation": 1.10, "sharpness": 0.5, "enabled": true }

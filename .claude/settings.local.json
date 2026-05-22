@@ -25,7 +25,9 @@
       "Bash(xmllint --xpath //data -)",
       "Bash(ls /Users/chengyuan/aiqipai/ios/srs_yql_p/*.md)",
       "Read(//Users/chengyuan/aiqipai/ios/**)",
-      "Read(//Users/chengyuan/aiqipai/**)"
+      "Read(//Users/chengyuan/aiqipai/**)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)"
     ]
   }
 }

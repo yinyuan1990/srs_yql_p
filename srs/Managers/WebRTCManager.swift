@@ -121,15 +121,16 @@ struct LadderPreset {
     let height: Int        // 输出高度（缩放后）
     let fps: Int           // 采集FPS
     let maxKbps: Int
+    let minKbps: Int       // BWE 最低码率（网络差时可降到此值）
     let maxPushFps: Int    // 🔥 最高推送FPS（根据分辨率限制）
     let scaleDown: Double  // 🔥 缩放比例（1.0=不缩放，2.0=缩小一半，3.0=缩小到1/3）
-    
-    // 兼容旧代码的初始化方法
-    init(width: Int, height: Int, fps: Int, maxKbps: Int, maxPushFps: Int = 60, scaleDown: Double = 1.0) {
+
+    init(width: Int, height: Int, fps: Int, maxKbps: Int, minKbps: Int = 0, maxPushFps: Int = 60, scaleDown: Double = 1.0) {
         self.width = width
         self.height = height
         self.fps = fps
         self.maxKbps = maxKbps
+        self.minKbps = minKbps > 0 ? minKbps : maxKbps / 2  // BWE最低=最高的50%，平衡清晰度和适应性
         self.maxPushFps = maxPushFps
         self.scaleDown = scaleDown
     }
@@ -305,6 +306,14 @@ final class WebRTCManager: NSObject, ObservableObject {
 
         return max(100, result)  // 保底 100kbps
     }
+
+    // BWE 最低码率（网络差时可降到此值，保证不卡顿）
+    private func effectiveMinKbpsForCurrentProfile() -> Int {
+        guard let preset = currentLadder[currentProfile] else { return 500 }
+        let qualityPercent = lastQualityPercent ?? 100
+        let result = Int(Double(preset.minKbps) * Double(qualityPercent) / 100.0)
+        return max(100, result)
+    }
     
     /// 设置平均推送的目标 FPS（采集保持不变，码率按比例调整）
     /// - Parameter fps: 后端下发的FPS值（0-240），实际推送为 fps/4（0-60）
@@ -392,6 +401,9 @@ final class WebRTCManager: NSObject, ObservableObject {
     ///   - rttMs: 往返延迟（毫秒）
     ///   - bitrateRatio: 码率达成率（v2.1不再使用，仅日志记录）
     private func processAdaptiveFps(instantLossRate: Double, packetsLostPerSec: Int, rttMs: Int, bitrateRatio: Double) {
+        // 抗频闪模式下不触发自适应升降帧
+        if antiFlickerEnabled { return }
+
         let now = Date()
         
         // 🔥 v2.1: 每秒只执行一次核心逻辑（statsTimer是200ms，但自适应以1秒为单位）
@@ -409,10 +421,10 @@ final class WebRTCManager: NSObject, ObservableObject {
             return
         }
         
-        // 🔥 v2.1: 冷却期检查（升降帧后3秒内不再变）
+        // 冷却期检查（降帧后1秒，升帧后2秒）
         let timeSinceLastChange = now.timeIntervalSince(lastFpsChangeTime)
-        if timeSinceLastChange < cooldownSec {
-           // print("📊 [自适应] fps=\(adaptiveFps) ❄️冷却中(\(String(format: "%.1f", cooldownSec - timeSinceLastChange))s后可变)")
+        let cooldown = lastFpsDirection == .down ? cooldownAfterDown : cooldownAfterUp
+        if timeSinceLastChange < cooldown {
             return
         }
         
@@ -445,41 +457,45 @@ final class WebRTCManager: NSObject, ObservableObject {
         let oldFps = adaptiveFps
         
         if isNetworkBad {
-            // 🔴 网络差：累积计数，达到阈值降帧
+            // 🔴 网络差：累积计数，达到阈值降帧（档位切换：直接减半）
             highLossCounter += 1
             lowLossCounter = 0
-            
+
             if highLossCounter >= downgradeHoldSec {
-                let newFps = max(minAdaptiveFps, adaptiveFps - fpsDownStep)
+                // 档位切换：找到当前帧率在 ladder 中的下一档
+                let newFps = fpsLadder.first(where: { $0 < adaptiveFps }) ?? fpsLadder.last ?? minAdaptiveFps
                 if newFps != adaptiveFps {
                     adaptiveFps = newFps
                     fpsChanged = true
-                    lastFpsChangeTime = now  // 🔥 记录变化时间，启动冷却
+                    lastFpsChangeTime = now
+                    lastFpsDirection = .down
                     print("⬇️ [降帧] \(oldFps)→\(adaptiveFps)fps (RTT=\(rttMs)ms 丢包=\(String(format: "%.1f", avgLossRate * 100))%)")
                 }
                 highLossCounter = 0
             }
         } else if isNetworkGood {
-            // 🟢 网络好：累积计数，达到阈值升帧
+            // 🟢 网络好：累积计数，达到阈值升帧（档位切换：直接翻倍）
             lowLossCounter += 1
             highLossCounter = 0
-            
+
             if lowLossCounter >= upgradeHoldSec {
-                let newFps = min(maxFps, adaptiveFps + fpsUpStep)
+                // 档位切换：找到当前帧率在 ladder 中的上一档
+                let newFps = min(maxFps, fpsLadder.last(where: { $0 > adaptiveFps }) ?? fpsLadder.first ?? 60)
                 if newFps != adaptiveFps {
                     adaptiveFps = newFps
                     fpsChanged = true
-                    lastFpsChangeTime = now  // 🔥 记录变化时间，启动冷却
+                    lastFpsChangeTime = now
+                    lastFpsDirection = .up
                     print("⬆️ [升帧] \(oldFps)→\(adaptiveFps)fps (上限\(maxFps)fps, RTT=\(rttMs)ms)")
                 }
                 lowLossCounter = 0
             }
         } else {
-            // 🟡 网络中等：每秒衰减1（比旧版每200ms衰减1慢5倍）
+            // 🟡 网络中等：每秒衰减1
             highLossCounter = max(0, highLossCounter - 1)
             lowLossCounter = max(0, lowLossCounter - 1)
         }
-        
+
         if fpsChanged {
             applyAdaptiveFps(adaptiveFps)
         }
@@ -542,6 +558,27 @@ final class WebRTCManager: NSObject, ObservableObject {
         iceServerConfig = servers
         let turnCount = servers.filter { $0.urls.contains(where: { $0.hasPrefix("turn:") }) }.count
         print("🔄 [iceServersUpdated] iceServerConfig 已更新: \(oldCount) → \(servers.count) 个 (TURN=\(turnCount))")
+    }
+
+    @objc private func onAntiFlickerCommand(_ notification: Notification) {
+        guard let userInfo = notification.userInfo else { return }
+        let enabled = userInfo["enabled"] as? Bool ?? false
+        let serverFps = userInfo["fps"] as? Int ?? 80
+        let actualFps = serverFps / 4  // 服务器格式转实际帧率
+
+        antiFlickerEnabled = enabled
+        antiFlickerFps = actualFps
+
+        if enabled {
+            // 锁定 FPS，应用抗频闪帧率
+            applyAdaptiveFps(actualFps)
+            print("🔦 [抗频闪] 开启，锁定 \(actualFps)fps（服务器值=\(serverFps)）")
+        } else {
+            // 恢复自适应
+            let restoreFps = targetOutputFPS
+            applyAdaptiveFps(restoreFps)
+            print("🔦 [抗频闪] 关闭，恢复 \(restoreFps)fps")
+        }
     }
 
     /// 处理 PC 端发来的 set_fps 通知
@@ -2052,6 +2089,10 @@ final class WebRTCManager: NSObject, ObservableObject {
     
     /// 自适应FPS开关（P0修复：默认关闭，避免与WebRTC BWE互相打架导致死亡螺旋）
     var adaptiveFpsEnabled: Bool = false
+
+    /// 抗频闪模式（PC端控制，开启后锁定FPS，自适应不触发）
+    var antiFlickerEnabled: Bool = false
+    var antiFlickerFps: Int = 20  // 实际帧率（80/4=20, 100/4=25, 200/4=50）
     
     /// 当前自适应FPS值（独立于后端下发的targetOutputFPS）
     private var adaptiveFps: Int = 30
@@ -2064,25 +2105,28 @@ final class WebRTCManager: NSObject, ObservableObject {
     /// 4. 升降帧后3秒冷却期（防止抖动）
     /// 5. 计数器以"秒"为单位，每秒只更新一次
     
-    private let minAdaptiveFps: Int = 10     // 🔥 极端弱网最低10fps（用户要求）
+    private let minAdaptiveFps: Int = 20     // 最低20fps（档位切换最低档）
     // maxAdaptiveFps 动态取值：使用 targetOutputFPS（后端下发的推送FPS）作为上限
+
+    /// 帧率档位表（直接切档，不逐步微调）
+    private let fpsLadder: [Int] = [60, 30, 20]
+
+    /// 丢包率阈值（基于3秒移动平均）
+    private let lossRateDownThreshold: Double = 0.025   // 3秒均值>2.5%，降级
+    private let lossRateUpThreshold: Double = 0.01      // 3秒均值<1%，恢复
+
+    /// RTT阈值（P2P直连更敏感）
+    private let rttDownThreshold: Int = 120    // RTT>120ms 网络差
+    private let rttUpThreshold: Int = 60       // RTT<60ms 且 >0 网络好
+
+    /// 档位切换核心参数
+    private let downgradeHoldSec: Int = 1     // 连续1秒网络差 → 降级（快速响应）
+    private let upgradeHoldSec: Int = 3       // 连续3秒网络好 → 升级
+    private let cooldownAfterDown: Double = 1.0  // 降帧后冷却1秒（可连续降）
+    private let cooldownAfterUp: Double = 2.0    // 升帧后冷却2秒（防震荡）
     
-    /// 丢包率阈值（基于3秒移动平均，比瞬时更稳定）
-    private let lossRateDownThreshold: Double = 0.03   // 3秒均值>3%，降级
-    private let lossRateUpThreshold: Double = 0.005    // 3秒均值<0.5%，恢复
-    
-    /// RTT阈值
-    private let rttDownThreshold: Int = 300   // RTT>300ms 网络差
-    private let rttUpThreshold: Int = 150     // RTT<150ms 且 >0 网络好
-    
-    /// 🔥🔥 v2.1 自适应算法核心参数（以"秒"为真实单位）
-    private let downgradeHoldSec: Int = 3    // 连续3秒网络差 → 降级
-    private let upgradeHoldSec: Int = 8      // 连续8秒网络好 → 升级
-    private let cooldownSec: Double = 3.0    // 🔥 升降帧后冷却3秒
-    
-    /// 步长设计：降快升慢
-    private let fpsDownStep: Int = 5         // 降帧快：每次降5fps
-    private let fpsUpStep: Int = 2           // 升帧慢：每次升2fps
+    /// 步长设计：档位切换（直接减半/翻倍）
+    // fpsDownStep/fpsUpStep 已废弃，改用 fpsLadder 档位切换
     
     /// 🔥 v2.1 丢包率移动平均（3秒窗口）
     private var lossRateHistory: [Double] = []
@@ -2091,9 +2135,11 @@ final class WebRTCManager: NSObject, ObservableObject {
     /// 连续计数器（每秒更新一次）
     private var highLossCounter: Int = 0
     private var lowLossCounter: Int = 0
-    
-    /// 🔥 v2.1 上次FPS变化时间（冷却期保护）
+
+    /// 上次FPS变化时间和方向（冷却期保护）
+    private enum FpsDirection { case up, down }
     private var lastFpsChangeTime: Date = Date.distantPast
+    private var lastFpsDirection: FpsDirection = .down
     
     /// 🔥 v2.1 上次自适应逻辑执行时间（确保每秒只执行一次）
     private var lastAdaptiveProcessTime: Date = Date.distantPast
@@ -2221,6 +2267,14 @@ final class WebRTCManager: NSObject, ObservableObject {
                 self,
                 selector: #selector(onIceServersUpdated(_:)),
                 name: NSNotification.Name("iceServersUpdated"),
+                object: nil
+        )
+
+        // 抗频闪指令监听（PC端控制）
+        NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onAntiFlickerCommand(_:)),
+                name: NSNotification.Name("AntiFlickerCommand"),
                 object: nil
         )
 
@@ -2869,9 +2923,10 @@ final class WebRTCManager: NSObject, ObservableObject {
             let targetKbps = effectiveMaxKbpsForCurrentProfile()
             let maxBps = targetKbps * 1000
 
-            // ★ CBR 恒定码率：min=max，防止 WebRTC 自动降码率
+            // ★ VBR 动态码率：给 BWE 调节空间，网络差时自动降码率保流畅
+            let minBps = effectiveMinKbpsForCurrentProfile() * 1000
             params.encodings[0].maxBitrateBps = NSNumber(value: maxBps)
-            params.encodings[0].minBitrateBps = NSNumber(value: maxBps)
+            params.encodings[0].minBitrateBps = NSNumber(value: minBps)
 
             // ★ FPS 设置（与 SRS 一致）
             let targetFps = frameThrottler?.targetSendFps ?? targetOutputFPS
@@ -2886,8 +2941,8 @@ final class WebRTCManager: NSObject, ObservableObject {
             let scaleDown = currentLadder[currentProfile]?.scaleDown ?? 1.0
             params.encodings[0].scaleResolutionDownBy = NSNumber(value: scaleDown)
 
-            // ★ 保持分辨率，网络差时降帧率而不是降分辨率
-            params.degradationPreference = NSNumber(value: 2)  // maintainResolution
+            // ★ 保帧率，网络差时降分辨率而不是丢帧（避免卡顿）
+            params.degradationPreference = NSNumber(value: 1)  // maintainFramerate
 
             // ★ 激活编码
             params.encodings[0].isActive = true
@@ -4308,7 +4363,7 @@ final class WebRTCManager: NSObject, ObservableObject {
         // .maintainResolution = 保持分辨率，网络差时降低帧率而不是分辨率
         // 这样可以防止 WebRTC 自动把 1920x1440 降到 960x720
         // RTCDegradationPreference: 0=disabled, 1=maintainFramerate, 2=maintainResolution, 3=balanced
-        params.degradationPreference = NSNumber(value: 2)  // maintainResolution
+        params.degradationPreference = NSNumber(value: 1)  // maintainFramerate — 保帧率降分辨率，避免卡顿
         
         // 🔥 关键：强制激活编码
         params.encodings[0].isActive = true
@@ -4365,7 +4420,7 @@ final class WebRTCManager: NSObject, ObservableObject {
         params.encodings[0].scaleResolutionDownBy = NSNumber(value: currentResolutionScale)
         // 🔥🔥 禁用 WebRTC 自动分辨率调整
         // RTCDegradationPreference: 0=disabled, 1=maintainFramerate, 2=maintainResolution, 3=balanced
-        params.degradationPreference = NSNumber(value: 2)  // maintainResolution
+        params.degradationPreference = NSNumber(value: 1)  // maintainFramerate — 保帧率降分辨率，避免卡顿
         sender.parameters = params
         
         // 计算输出分辨率
@@ -4450,7 +4505,7 @@ final class WebRTCManager: NSObject, ObservableObject {
         
         // 🔥🔥 禁用 WebRTC 自动分辨率调整
         // RTCDegradationPreference: 0=disabled, 1=maintainFramerate, 2=maintainResolution, 3=balanced
-        params.degradationPreference = NSNumber(value: 2)  // maintainResolution
+        params.degradationPreference = NSNumber(value: 1)  // maintainFramerate — 保帧率降分辨率，避免卡顿
         
         sender.parameters = params
         
@@ -4478,8 +4533,8 @@ final class WebRTCManager: NSObject, ObservableObject {
             // 🔥 应用当前档位的缩放比例
             let scaleDown3 = self.currentLadder[self.currentProfile]?.scaleDown ?? 1.0
             params2.encodings[0].scaleResolutionDownBy = NSNumber(value: scaleDown3)
-            // 🔥🔥 禁用 WebRTC 自动分辨率调整
-            params2.degradationPreference = NSNumber(value: 2)  // maintainResolution
+            // 保帧率降分辨率，避免卡顿
+            params2.degradationPreference = NSNumber(value: 1)  // maintainFramerate
             sender.parameters = params2
             
             // 计算输出分辨率
@@ -4516,7 +4571,7 @@ final class WebRTCManager: NSObject, ObservableObject {
                 params.encodings[0].isActive = true
                 // 🔥🔥 禁用 WebRTC 自动分辨率调整
                 // RTCDegradationPreference: 0=disabled, 1=maintainFramerate, 2=maintainResolution, 3=balanced
-        params.degradationPreference = NSNumber(value: 2)  // maintainResolution
+        params.degradationPreference = NSNumber(value: 1)  // maintainFramerate — 保帧率降分辨率，避免卡顿
                 sender.parameters = params
             }
         }

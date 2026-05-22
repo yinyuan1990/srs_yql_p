@@ -24,6 +24,8 @@
 		2C25E1242E5FBB5B00EA9245 /* ConfigManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C25E1232E5FBB5B00EA9245 /* ConfigManager.swift */; };
 		2C25E1262E5FBBEB00EA9245 /* APIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C25E1252E5FBBEB00EA9245 /* APIService.swift */; };
 		2C25E12B2E5FCF6000EA9245 /* WebSocketManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C25E12A2E5FCF6000EA9245 /* WebSocketManager.swift */; };
+		2C3013742FBF30C900AD848A /* FrameThrottler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3013732FBF30C900AD848A /* FrameThrottler.swift */; };
+		2C3013762FBF30FB00AD848A /* VideoFilterPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3013752FBF30FB00AD848A /* VideoFilterPipeline.swift */; };
 		2C404C5B2E6A27DD0015CF69 /* ProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C404C5A2E6A27DD0015CF69 /* ProfileView.swift */; };
 		2C4151A12F13AB7600272C01 /* user_agreement.html in Resources */ = {isa = PBXBuildFile; fileRef = 2C4151A02F13AB7600272C01 /* user_agreement.html */; };
 		2C4151A32F13AB8400272C01 /* privacy_policy.html in Resources */ = {isa = PBXBuildFile; fileRef = 2C4151A22F13AB8400272C01 /* privacy_policy.html */; };
@@ -64,6 +66,8 @@
 		2C25E1232E5FBB5B00EA9245 /* ConfigManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigManager.swift; sourceTree = "<group>"; };
 		2C25E1252E5FBBEB00EA9245 /* APIService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIService.swift; sourceTree = "<group>"; };
 		2C25E12A2E5FCF6000EA9245 /* WebSocketManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSocketManager.swift; sourceTree = "<group>"; };
+		2C3013732FBF30C900AD848A /* FrameThrottler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameThrottler.swift; sourceTree = "<group>"; };
+		2C3013752FBF30FB00AD848A /* VideoFilterPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoFilterPipeline.swift; sourceTree = "<group>"; };
 		2C404C5A2E6A27DD0015CF69 /* ProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileView.swift; sourceTree = "<group>"; };
 		2C4151A02F13AB7600272C01 /* user_agreement.html */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.html; path = user_agreement.html; sourceTree = "<group>"; };
 		2C4151A22F13AB8400272C01 /* privacy_policy.html */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.html; path = privacy_policy.html; sourceTree = "<group>"; };
@@ -119,6 +123,8 @@
 		2C25E1222E5FBB4200EA9245 /* Managers */ = {
 			isa = PBXGroup;
 			children = (
+				2C3013732FBF30C900AD848A /* FrameThrottler.swift */,
+				2C3013752FBF30FB00AD848A /* VideoFilterPipeline.swift */,
 				2C25E1232E5FBB5B00EA9245 /* ConfigManager.swift */,
 				2C25E12A2E5FCF6000EA9245 /* WebSocketManager.swift */,
 				2C5B00512E90DC5100755FBF /* WebRTCManager.swift */,
@@ -270,11 +276,13 @@
 			files = (
 				2C596C5A2E58E22500C94789 /* ContentView.swift in Sources */,
 				2C4151A52F13ABF000272C01 /* LocalWebView.swift in Sources */,
+				2C3013742FBF30C900AD848A /* FrameThrottler.swift in Sources */,
 				2C22825D2EFFDBDA00A10E1A /* GPUImageTestView.swift in Sources */,
 				2C25E1242E5FBB5B00EA9245 /* ConfigManager.swift in Sources */,
 				2CF5F4362F3759EA00AA0575 /* BackgroundAudioManager.swift in Sources */,
 				2C25E1212E5FBAFE00EA9245 /* DeviceConfig.swift in Sources */,
 				2C22825C2EFFDBDA00A10E1A /* GPUImageCaptureTest.swift in Sources */,
+				2C3013762FBF30FB00AD848A /* VideoFilterPipeline.swift in Sources */,
 				2C0BB2D32EE6B85800332D6F /* AESUtils.swift in Sources */,
 				2CB8FA4E2E73C59A00F90666 /* ImagePicker.swift in Sources */,
 				2C0BB2B02ED5B8C100332D6F /* QRScannerView.swift in Sources */,
@@ -433,7 +441,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "\"srs/Preview Content\"";
-				DEVELOPMENT_TEAM = AV662P693M;
+				DEVELOPMENT_TEAM = 89V3HHXY9F;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = srs/Info.plist;
@@ -469,7 +477,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "\"srs/Preview Content\"";
-				DEVELOPMENT_TEAM = AV662P693M;
+				DEVELOPMENT_TEAM = 89V3HHXY9F;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = srs/Info.plist;

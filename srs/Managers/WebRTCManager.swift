@@ -581,23 +581,21 @@ final class WebRTCManager: NSObject, ObservableObject {
         // 更新自适应FPS值
         adaptiveFps = targetFps
         
-        // 🔥 v10.1 防花屏：根据 urgency 决定执行方式 + 降码率 + 插I帧
+        // 根据 urgency 决定执行方式，码率保持恒定不降（让 WebRTC 内部 BWE 处理）
         switch urgency {
         case "critical":
-            // 🚨 紧急：50ms内执行，码率降50%，立即插I帧
-            let reducedBitrate = bitrate > 0 ? bitrate : Int(Double(targetBitrateKbps * 1000) * 0.5)
-            applyFpsImmediately(targetFps, bitrate: reducedBitrate)
+            // 🚨 紧急：立即执行，插I帧，码率不变（降码率会触发BWE死亡螺旋）
+            applyFpsImmediately(targetFps, bitrate: 0)
             forceKeyframe()  // 🔑 立即插I帧
-            keyframeIntervalSec = gopExtreme  // GOP调整为0.5秒
-            print("🚨 [critical] 码率降50%=\(reducedBitrate/1000)kbps, GOP=\(gopExtreme)s, 立即插I帧")
-            
+            keyframeIntervalSec = gopExtreme
+            print("🚨 [critical] FPS→\(targetFps), 码率保持不变, GOP=\(gopExtreme)s, 立即插I帧")
+
         case "high":
-            // ⚡ 高优先级：200ms内执行，码率降30%，立即插I帧
-            let reducedBitrate = bitrate > 0 ? bitrate : Int(Double(targetBitrateKbps * 1000) * 0.7)
-            applyFpsImmediately(targetFps, bitrate: reducedBitrate)
+            // ⚡ 高优先级：立即执行，插I帧，码率不变
+            applyFpsImmediately(targetFps, bitrate: 0)
             forceKeyframe()  // 🔑 立即插I帧
-            keyframeIntervalSec = gopWeak  // GOP调整为0.5秒
-            print("⚡ [high] 码率降30%=\(reducedBitrate/1000)kbps, GOP=\(gopWeak)s, 立即插I帧")
+            keyframeIntervalSec = gopWeak
+            print("⚡ [high] FPS→\(targetFps), 码率保持不变, GOP=\(gopWeak)s, 立即插I帧")
             
         case "normal":
             // 正常：可短暂过渡，码率不变
@@ -4469,9 +4467,9 @@ final class WebRTCManager: NSObject, ObservableObject {
             var params2 = sender.parameters
             if params2.encodings.isEmpty { return }
             
-            // 🔥 VBR策略：码率可下浮，但不能超过最大值
-            let maxBps2 = self.targetBitrateKbps * 1000  // 最大码率（硬上限）
-            let minBps2 = Int(Double(maxBps2) * 0.7)  // 允许下浮30%
+            // CBR：min=max，防止 WebRTC BWE 自动降码率
+            let maxBps2 = self.targetBitrateKbps * 1000
+            let minBps2 = maxBps2
             
             params2.encodings[0].minBitrateBps = NSNumber(value: minBps2)
             params2.encodings[0].maxBitrateBps = NSNumber(value: maxBps2)

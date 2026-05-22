@@ -4908,10 +4908,10 @@ final class WebRTCManager: NSObject, ObservableObject {
                             }
                             let smoothedKbps = self.kbpsHistory.reduce(0, +) / max(self.kbpsHistory.count, 1)
 
-                            // 🔥 显示稳定性：静止画面编码器产出少，但显示不能偏离目标超过 100kbps
-                            // 只对显示值做下限保护，实际发送字节不变
+                            // 显示值钳制：下限不低于目标-100，上限不超过档位maxKbps
                             let displayFloor = max(0, self.targetBitrateKbps - 100)
-                            let displayKbps = max(displayFloor, smoothedKbps)
+                            let profileCeil = self.currentLadder[self.currentProfile]?.maxKbps ?? self.targetBitrateKbps
+                            let displayKbps = min(profileCeil, max(displayFloor, smoothedKbps))
 
                             self.currentKbps = displayKbps
                             WebSocketManager.publishingKbps = displayKbps

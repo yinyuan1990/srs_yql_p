@@ -3456,12 +3456,13 @@ final class WebRTCManager: NSObject, ObservableObject {
                 // 🔥🔥 关键：显式锁定帧率，防止手动曝光后帧率被自动降低
                 // 直接使用 currentCaptureFPS（在 startCapture 前已正确设置）
                 // 不从 activeFormat 读取，因为 startCapture 是异步的，格式可能还没更新
-                let targetFps = currentCaptureFPS
+                let formatMaxFps = Int(device.activeFormat.videoSupportedFrameRateRanges.first?.maxFrameRate ?? 60)
+                let targetFps = min(currentCaptureFPS, formatMaxFps)
                 if targetFps > 0 {
                     let frameDuration = CMTime(value: 1, timescale: CMTimeScale(targetFps))
                     device.activeVideoMinFrameDuration = frameDuration
                     device.activeVideoMaxFrameDuration = frameDuration
-                    print("📹 帧率锁定: \(targetFps)fps")
+                    print("📹 帧率锁定: \(targetFps)fps (format上限\(formatMaxFps)fps)")
                 }
             } else if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure

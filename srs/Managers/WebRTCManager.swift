@@ -5289,6 +5289,11 @@ final class WebRTCManager: NSObject, ObservableObject {
                 return
             }
             let candidate = message["candidate"] as? String ?? ""
+            // end-of-candidates 信号：空字符串，直接忽略，不能加入 PeerConnection
+            guard !candidate.isEmpty else {
+                print("📥 [P2P] PC \(fromDevice) end-of-candidates 信号，忽略")
+                return
+            }
             let sdpMid = message["sdpMid"] as? String ?? "0"
             let sdpMLineIndex = message["sdpMLineIndex"] as? Int32 ?? 0
             let ice = RTCIceCandidate(sdp: candidate,

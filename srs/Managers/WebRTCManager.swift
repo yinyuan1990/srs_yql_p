@@ -146,6 +146,7 @@ final class WebRTCManager: NSObject, ObservableObject {
     
     // MARK: - 对外状态
     @Published var isPublishing = false
+    @Published var viewerConnected: Bool = false
     var currentKbps: Int = 0       // 🔥 去掉@Published，纯统计不触发UI刷新
     var currentFps: Int = 0         // 🔥 去掉@Published，纯统计不触发UI刷新
     @Published var currentProfile: LadderProfile = .standard
@@ -5203,6 +5204,12 @@ final class WebRTCManager: NSObject, ObservableObject {
         print("🔔 [P2P-DEBUG] handleWebRTCSignaling: type=\(type), from=\(fromDevice)")
 
         switch type {
+        case "VIEWER_CONNECTED":
+            print("✅ [P2P] PC \(fromDevice) 已收到画面")
+            DispatchQueue.main.async { self.viewerConnected = true }
+        case "VIEWER_DISCONNECTED":
+            print("🔌 [P2P] PC \(fromDevice) 断开连接")
+            DispatchQueue.main.async { self.viewerConnected = false }
         // ★★★ 新增：PC 请求观看（核心入口）
         case "WEBRTC_REQUEST":
             print("📥 [P2P] 收到 PC \(fromDevice) 的观看请求")

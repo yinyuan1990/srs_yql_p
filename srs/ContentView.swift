@@ -652,11 +652,11 @@ struct ContentView: View {
                 HStack {
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(rtc.viewerConnected ? Color.green : Color.gray.opacity(0.7))
+                            .fill(rtc.viewerConnected ? Color.green : Color.red)
                             .frame(width: 7, height: 7)
                         Text(rtc.viewerConnected ? "PC已连接" : "PC未连接")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white)
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(rtc.viewerConnected ? .green : .red)
                     }
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)

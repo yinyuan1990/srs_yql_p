@@ -148,6 +148,8 @@ final class WebRTCManager: NSObject, ObservableObject {
     // MARK: - 对外状态
     @Published var isPublishing = false
     @Published var viewerConnected: Bool = false
+    private var lastViewerHeartbeatTime: Date = Date.distantPast
+    private var viewerHeartbeatChecker: Timer?
     var currentKbps: Int = 0       // 🔥 去掉@Published，纯统计不触发UI刷新
     var currentFps: Int = 0         // 🔥 去掉@Published，纯统计不触发UI刷新
     @Published var currentProfile: LadderProfile = .standard
@@ -558,6 +560,15 @@ final class WebRTCManager: NSObject, ObservableObject {
         iceServerConfig = servers
         let turnCount = servers.filter { $0.urls.contains(where: { $0.hasPrefix("turn:") }) }.count
         print("🔄 [iceServersUpdated] iceServerConfig 已更新: \(oldCount) → \(servers.count) 个 (TURN=\(turnCount))")
+    }
+
+    @objc private func onViewerHeartbeat(_ notification: Notification) {
+        lastViewerHeartbeatTime = Date()
+        if !viewerConnected {
+            viewerConnected = true
+            let fps = (notification.userInfo?["fps"] as? Int) ?? 0
+            print("📺 [VIEWER] PC 已连接，接收 \(fps)fps")
+        }
     }
 
     @objc private func onAntiFlickerCommand(_ notification: Notification) {
@@ -2274,6 +2285,23 @@ final class WebRTCManager: NSObject, ObservableObject {
                 name: NSNotification.Name("AntiFlickerCommand"),
                 object: nil
         )
+
+        // PC 拉流心跳监听
+        NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(onViewerHeartbeat(_:)),
+                name: NSNotification.Name("ViewerHeartbeat"),
+                object: nil
+        )
+        // 启动 3 秒超时检查器
+        viewerHeartbeatChecker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let elapsed = Date().timeIntervalSince(self.lastViewerHeartbeatTime)
+            if elapsed > 3.0 && self.viewerConnected {
+                self.viewerConnected = false
+                print("📺 [VIEWER] 心跳超时，PC 未连接")
+            }
+        }
 
         // ⭐ 监听视频滤镜参数热更新（登录下发 / STOMP 推送）
         NotificationCenter.default.addObserver(
